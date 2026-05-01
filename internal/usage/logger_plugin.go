@@ -5,7 +5,10 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 var statisticsEnabled atomic.Bool
@@ -86,6 +90,10 @@ type modelStats struct {
 	TotalTokens   int64
 	Details       []RequestDetail
 }
+
+// MaxDetailsPerModel limits the number of stored request details per model
+// to prevent unbounded memory growth. Once exceeded, the oldest entries are trimmed.
+const MaxDetailsPerModel = 2000
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
@@ -223,6 +231,10 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+	if len(modelStatsValue.Details) > MaxDetailsPerModel {
+		excess := len(modelStatsValue.Details) - MaxDetailsPerModel
+		modelStatsValue.Details = modelStatsValue.Details[excess:]
+	}
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -481,4 +493,98 @@ func formatHour(hour int) string {
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+// SaveToFile serialises the current statistics snapshot as JSON and writes it to path.
+// An empty path is a no-op. The file is written atomically via a temp file + rename.
+func (s *RequestStatistics) SaveToFile(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	snapshot := s.Snapshot()
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("usage: marshal snapshot: %w", err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("usage: create stats dir %s: %w", dir, err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("usage: write stats temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("usage: rename stats file: %w", err)
+	}
+	log.Debugf("usage: statistics saved to %s (%d bytes)", path, len(data))
+	return nil
+}
+
+// LoadFromFile reads a previously saved statistics snapshot and merges it into
+// the current store. Missing files are silently ignored.
+func (s *RequestStatistics) LoadFromFile(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("usage: read stats file: %w", err)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	var snapshot StatisticsSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return fmt.Errorf("usage: unmarshal stats: %w", err)
+	}
+	result := s.MergeSnapshot(snapshot)
+	log.Infof("usage: loaded statistics from %s (added %d, skipped %d)", path, result.Added, result.Skipped)
+	return nil
+}
+
+// DefaultStatsSavePath returns the conventional path for the usage statistics file
+// inside the configured auth directory. Falls back to "usage_stats.json" in the
+// working directory when authDir is empty.
+func DefaultStatsSavePath(authDir string) string {
+	dir := strings.TrimSpace(authDir)
+	if dir == "" {
+		dir = "."
+	}
+	return filepath.Join(dir, "usage_stats.json")
+}
+
+// AutoSaveInterval is the default interval for periodic statistics persistence.
+const AutoSaveInterval = 5 * time.Minute
+
+// StartAutoSave launches a background goroutine that periodically persists the
+// default statistics store to path. The goroutine exits when ctx is cancelled.
+func StartAutoSave(ctx context.Context, path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	stats := GetRequestStatistics()
+	go func() {
+		ticker := time.NewTicker(AutoSaveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				if err := stats.SaveToFile(path); err != nil {
+					log.Errorf("usage: final auto-save failed: %v", err)
+				}
+				return
+			case <-ticker.C:
+				if err := stats.SaveToFile(path); err != nil {
+					log.Errorf("usage: auto-save failed: %v", err)
+				}
+			}
+		}
+	}()
 }

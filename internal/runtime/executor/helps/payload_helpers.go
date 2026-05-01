@@ -2,6 +2,7 @@ package helps
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -451,4 +452,51 @@ func matchModelPattern(pattern, model string) bool {
 		pi++
 	}
 	return pi == len(pattern)
+}
+
+// EnsureReasoningContentInAssistantMessages ensures every assistant message in the
+// messages array has a reasoning_content field when the request targets a DeepSeek
+// model with reasoning_effort set (thinking mode). DeepSeek and similar reasoning-model
+// APIs reject requests where any assistant message is missing this field, even when
+// the turn had no thinking text.
+func EnsureReasoningContentInAssistantMessages(body []byte) []byte {
+	if !gjson.GetBytes(body, "reasoning_effort").Exists() {
+		return body
+	}
+	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
+	if !strings.HasPrefix(model, "deepseek") {
+		return body
+	}
+	messages := gjson.GetBytes(body, "messages").Array()
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Get("role").String() != "assistant" {
+			continue
+		}
+		if messages[i].Get("reasoning_content").Exists() {
+			continue
+		}
+		path := fmt.Sprintf("messages.%d.reasoning_content", i)
+		var err error
+		body, err = sjson.SetBytes(body, path, "")
+		if err != nil {
+			return body
+		}
+	}
+	return body
+}
+
+// RestoreDeepSeekReasoningEffort restores the original reasoning_effort value for
+// DeepSeek models after ApplyThinking may have clamped it. DeepSeek APIs support
+// effort levels (e.g. xhigh/max) that the registry may under-report for openai-compat
+// models. Only acts when the value was actually changed.
+func RestoreDeepSeekReasoningEffort(body []byte, baseModel string, originalEffort string) []byte {
+	if originalEffort == "" || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(baseModel)), "deepseek") {
+		return body
+	}
+	if clamped := gjson.GetBytes(body, "reasoning_effort").String(); clamped != originalEffort {
+		if updated, err := sjson.SetBytes(body, "reasoning_effort", originalEffort); err == nil {
+			return updated
+		}
+	}
+	return body
 }

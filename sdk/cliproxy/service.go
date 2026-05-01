@@ -16,7 +16,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
-	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -482,6 +482,12 @@ func (s *Service) Run(ctx context.Context) error {
 
 	usage.StartDefault(ctx)
 
+	statsPath := internalusage.DefaultStatsSavePath(s.cfg.AuthDir)
+	if err := internalusage.GetRequestStatistics().LoadFromFile(statsPath); err != nil {
+		log.Warnf("usage: failed to load persisted statistics: %v", err)
+	}
+	internalusage.StartAutoSave(ctx, statsPath)
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 	defer func() {
@@ -789,6 +795,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if err := internalusage.GetRequestStatistics().SaveToFile(internalusage.DefaultStatsSavePath(s.cfg.AuthDir)); err != nil {
+			log.Errorf("usage: failed to persist statistics on shutdown: %v", err)
+		}
 		usage.StopDefault()
 	})
 	return shutdownErr

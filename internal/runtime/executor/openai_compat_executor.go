@@ -18,6 +18,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -105,10 +106,20 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
+	// Save original reasoning_effort before ApplyThinking clamps it.
+	// DeepSeek models support xhigh/max but the registry may not include it.
+	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
+
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
+
+	// Restore DeepSeek reasoning_effort clamped by ApplyThinking; upstream
+	// DeepSeek APIs support levels (xhigh/max) the registry may under-report.
+	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
+
+	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -203,14 +214,20 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
 
+	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
+
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
 
+	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
+
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+
+	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
