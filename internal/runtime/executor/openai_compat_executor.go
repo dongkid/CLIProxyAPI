@@ -38,6 +38,45 @@ func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatE
 // Identifier implements cliproxyauth.ProviderExecutor.
 func (e *OpenAICompatExecutor) Identifier() string { return e.provider }
 
+// resolveCompatEntry returns the OpenAICompatibility config entry for this
+// executor's provider, or nil if not found.
+func (e *OpenAICompatExecutor) resolveCompatEntry() *config.OpenAICompatibility {
+	if e == nil || e.cfg == nil {
+		return nil
+	}
+	for i := range e.cfg.OpenAICompatibility {
+		compat := &e.cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
+		if strings.EqualFold(compat.Name, e.provider) {
+			return compat
+		}
+	}
+	return nil
+}
+
+// isOpenCodeProvider reports whether this executor targets an OpenCode
+// (GoPlan) backend, which uses the x-opencode-* header convention for
+// session tracking and cache affinity.
+func (e *OpenAICompatExecutor) isOpenCodeProvider() bool {
+	compat := e.resolveCompatEntry()
+	if compat == nil {
+		return false
+	}
+	return strings.Contains(compat.BaseURL, "opencode.ai")
+}
+
+// sessionAffinityHeaderName returns the configured session-affinity HTTP header
+// name for this provider, or "" when the provider does not opt into session forwarding.
+func (e *OpenAICompatExecutor) sessionAffinityHeaderName() string {
+	compat := e.resolveCompatEntry()
+	if compat == nil {
+		return ""
+	}
+	return strings.TrimSpace(compat.SessionAffinityHeader)
+}
+
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
 func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -131,6 +170,24 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if headerName := e.sessionAffinityHeaderName(); headerName != "" {
+		if sid := cliproxyauth.ExtractSessionID(opts.Headers, req.Payload, opts.Metadata); sid != "" {
+			// The official OpenCode CLI uses two mutually-exclusive header sets
+			// depending on the provider type. For OpenCode providers, send the
+			// x-opencode-* set; for all others, forward the configured header.
+			if e.isOpenCodeProvider() {
+				goSessionID := helps.OpenCodeSessionID(sid)
+				httpReq.Header.Set("x-opencode-session", goSessionID)
+				httpReq.Header.Set("x-opencode-client", "cpa")
+				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding x-opencode-session=%s", cliproxyauth.TruncateSessionID(goSessionID))
+			} else {
+				httpReq.Header.Set(headerName, sid)
+				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding %s=%s", headerName, cliproxyauth.TruncateSessionID(sid))
+			}
+		} else {
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: header %s configured but no session ID extracted", headerName)
+		}
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -239,6 +296,24 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if headerName := e.sessionAffinityHeaderName(); headerName != "" {
+		if sid := cliproxyauth.ExtractSessionID(opts.Headers, req.Payload, opts.Metadata); sid != "" {
+			// The official OpenCode CLI uses two mutually-exclusive header sets
+			// depending on the provider type. For OpenCode providers, send the
+			// x-opencode-* set; for all others, forward the configured header.
+			if e.isOpenCodeProvider() {
+				goSessionID := helps.OpenCodeSessionID(sid)
+				httpReq.Header.Set("x-opencode-session", goSessionID)
+				httpReq.Header.Set("x-opencode-client", "cpa")
+				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding x-opencode-session=%s", cliproxyauth.TruncateSessionID(goSessionID))
+			} else {
+				httpReq.Header.Set(headerName, sid)
+				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding %s=%s", headerName, cliproxyauth.TruncateSessionID(sid))
+			}
+		} else {
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: header %s configured but no session ID extracted", headerName)
+		}
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

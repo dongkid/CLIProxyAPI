@@ -161,9 +161,8 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		// Handle reasoning content delta
 		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
-				if reasoningText == "" {
-					continue
-				}
+				// Start thinking block even when text is empty so the
+				// round-trip preserves that reasoning_content was present.
 				stopTextContentBlock(param, &results)
 				if !param.ThinkingContentBlockStarted {
 					if param.ThinkingContentBlockIndex == -1 {
@@ -176,7 +175,9 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSONBytes, 2))
 					param.ThinkingContentBlockStarted = true
 				}
-
+				if reasoningText == "" {
+					continue
+				}
 				thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
 				thinkingDeltaJSONBytes := []byte(thinkingDeltaJSON)
 				thinkingDeltaJSONBytes, _ = sjson.SetBytes(thinkingDeltaJSONBytes, "index", param.ThinkingContentBlockIndex)
@@ -399,11 +400,11 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 
 		reasoningNode := choice.Get("message.reasoning_content")
 		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
-			if reasoningText == "" {
-				continue
-			}
+			// Emit thinking block even when empty to preserve round-trip context.
 			block := []byte(`{"type":"thinking","thinking":""}`)
-			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+			if reasoningText != "" {
+				block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+			}
 			out, _ = sjson.SetRawBytes(out, "content.-1", block)
 		}
 
@@ -501,14 +502,10 @@ func collectOpenAIReasoningTexts(node gjson.Result) []string {
 
 	switch node.Type {
 	case gjson.String:
-		if text := node.String(); text != "" {
-			texts = append(texts, text)
-		}
+		texts = append(texts, node.String())
 	case gjson.JSON:
 		if text := node.Get("text"); text.Exists() {
-			if textStr := text.String(); textStr != "" {
-				texts = append(texts, textStr)
-			}
+			texts = append(texts, text.String())
 		} else if raw := node.Raw; raw != "" && !strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "[") {
 			texts = append(texts, raw)
 		}
@@ -582,6 +579,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 				if contentResult.IsArray() {
 					var textBuilder strings.Builder
 					var thinkingBuilder strings.Builder
+					var sawReasoning bool
 
 					flushText := func() {
 						if textBuilder.Len() == 0 {
@@ -594,13 +592,14 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					}
 
 					flushThinking := func() {
-						if thinkingBuilder.Len() == 0 {
+						if thinkingBuilder.Len() == 0 && !sawReasoning {
 							return
 						}
 						block := []byte(`{"type":"thinking","thinking":""}`)
 						block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
 						out, _ = sjson.SetRawBytes(out, "content.-1", block)
 						thinkingBuilder.Reset()
+						sawReasoning = false
 					}
 
 					for _, item := range contentResult.Array() {
@@ -637,6 +636,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 							}
 						case "reasoning":
 							flushText()
+							sawReasoning = true
 							if thinking := item.Get("text"); thinking.Exists() {
 								thinkingBuilder.WriteString(thinking.String())
 							}
@@ -660,11 +660,10 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
 				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
-					if reasoningText == "" {
-						continue
-					}
 					block := []byte(`{"type":"thinking","thinking":""}`)
-					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+					if reasoningText != "" {
+						block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+					}
 					out, _ = sjson.SetRawBytes(out, "content.-1", block)
 				}
 			}

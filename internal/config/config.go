@@ -538,6 +538,13 @@ type OpenAICompatibility struct {
 
 	// Headers optionally adds extra HTTP headers for requests sent to this provider.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// SessionAffinityHeader is the HTTP header name used to forward a stable session
+	// identifier to the upstream provider for prompt-cache affinity (e.g.,
+	// "x-session-affinity" for OpenCode GoPlan / Fireworks). When empty, no session
+	// header is injected. The session ID is extracted from the incoming client request
+	// via the same extraction logic used for internal session-affinity routing.
+	SessionAffinityHeader string `yaml:"session-affinity-header,omitempty" json:"session-affinity-header,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

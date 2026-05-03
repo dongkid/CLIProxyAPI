@@ -1,6 +1,8 @@
 package helps
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -499,4 +501,18 @@ func RestoreDeepSeekReasoningEffort(body []byte, baseModel string, originalEffor
 		}
 	}
 	return body
+}
+
+// OpenCodeSessionID converts a CPA-internal session ID to the ses_ format
+// expected by OpenCode GoPlan for session tracking (e.g., in the
+// x-opencode-session header). The format is ses_ + 12 hex + 14 hex chars,
+// derived from SHA-256 of the input to ensure deterministic mapping.
+func OpenCodeSessionID(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(sessionID))
+	hexStr := hex.EncodeToString(hash[:])
+	return "ses_" + hexStr[:12] + hexStr[12:26]
 }

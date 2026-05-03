@@ -528,15 +528,20 @@ func (s *RequestStatistics) LoadFromFile(path string) error {
 	return nil
 }
 
-// DefaultStatsSavePath returns the conventional path for the usage statistics file
-// inside the configured auth directory. Falls back to "usage_stats.json" in the
-// working directory when authDir is empty.
+// DefaultStatsSavePath returns the conventional path for the usage statistics file.
+// The file is placed in a "data" directory alongside the auth directory to avoid
+// being picked up by the auth file watcher, which treats every .json inside the
+// auth directory as a credential file.
 func DefaultStatsSavePath(authDir string) string {
 	dir := strings.TrimSpace(authDir)
-	if dir == "" {
-		dir = "."
+	if dir == "" || dir == "." {
+		return "usage_stats.json"
 	}
-	return filepath.Join(dir, "usage_stats.json")
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	return filepath.Join(filepath.Dir(abs), "data", "usage_stats.json")
 }
 
 // AutoSaveInterval is the default interval for periodic statistics persistence.
