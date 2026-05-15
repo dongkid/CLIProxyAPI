@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
@@ -60,6 +60,13 @@ func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
 	fileEntry, ok := filesRaw[0].(map[string]any)
 	if !ok {
 		t.Fatalf("expected file entry object, got %#v", filesRaw[0])
+	}
+
+	if _, ok := fileEntry["success"].(float64); !ok {
+		t.Fatalf("expected success number, got %#v", fileEntry["success"])
+	}
+	if _, ok := fileEntry["failed"].(float64); !ok {
+		t.Fatalf("expected failed number, got %#v", fileEntry["failed"])
 	}
 
 	recentRaw, ok := fileEntry["recent_requests"].([]any)
