@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -93,7 +93,17 @@ type modelStats struct {
 
 // MaxDetailsPerModel limits the number of stored request details per model
 // to prevent unbounded memory growth. Once exceeded, the oldest entries are trimmed.
-const MaxDetailsPerModel = 2000
+// Set via SetMaxDetailsPerModel; defaults to 2000.
+var MaxDetailsPerModel = 2000
+
+// SetMaxDetailsPerModel updates the global detail retention limit. A value <= 0
+// resets to the default of 2000.
+func SetMaxDetailsPerModel(n int) {
+	if n <= 0 {
+		n = 2000
+	}
+	MaxDetailsPerModel = n
+}
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
@@ -101,21 +111,37 @@ type RequestDetail struct {
 	LatencyMs int64      `json:"latency_ms"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
+	Model     string     `json:"model"`
+	Alias     string     `json:"alias,omitempty"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
+	Fail      FailDetail `json:"fail,omitempty"`
+}
+
+// FailDetail captures HTTP failure metadata for a failed upstream attempt.
+type FailDetail struct {
+	StatusCode int    `json:"status_code,omitempty"`
+	Body       string `json:"body,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
 type TokenStats struct {
-	InputTokens     int64 `json:"input_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
-	CachedTokens    int64 `json:"cached_tokens"`
-	TotalTokens     int64 `json:"total_tokens"`
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	CachedTokens        int64 `json:"cached_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens,omitempty"`
+	TotalTokens         int64 `json:"total_tokens"`
 }
+
+// statsVersion is embedded in saved snapshots for forward compatibility.
+const statsVersion = 1
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
 type StatisticsSnapshot struct {
+	Version int `json:"version"`
+
 	TotalRequests int64 `json:"total_requests"`
 	SuccessCount  int64 `json:"success_count"`
 	FailureCount  int64 `json:"failure_count"`
@@ -186,6 +212,17 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if modelName == "" {
 		modelName = "unknown"
 	}
+	alias := record.Alias
+	if alias == "" {
+		alias = record.Model
+	}
+	failInfo := FailDetail{}
+	if record.Fail.StatusCode != 0 || record.Fail.Body != "" {
+		failInfo = FailDetail{
+			StatusCode: record.Fail.StatusCode,
+			Body:       record.Fail.Body,
+		}
+	}
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
@@ -210,8 +247,11 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
+		Model:     modelName,
+		Alias:     alias,
 		Tokens:    detail,
 		Failed:    failed,
+		Fail:      failInfo,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -239,7 +279,7 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
-	result := StatisticsSnapshot{}
+	result := StatisticsSnapshot{Version: statsVersion}
 	if s == nil {
 		return result
 	}
@@ -435,11 +475,13 @@ const httpStatusBadRequest = 400
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
 	tokens := TokenStats{
-		InputTokens:     detail.InputTokens,
-		OutputTokens:    detail.OutputTokens,
-		ReasoningTokens: detail.ReasoningTokens,
-		CachedTokens:    detail.CachedTokens,
-		TotalTokens:     detail.TotalTokens,
+		InputTokens:         detail.InputTokens,
+		OutputTokens:        detail.OutputTokens,
+		ReasoningTokens:     detail.ReasoningTokens,
+		CachedTokens:        detail.CachedTokens,
+		CacheReadTokens:     detail.CacheReadTokens,
+		CacheCreationTokens: detail.CacheCreationTokens,
+		TotalTokens:         detail.TotalTokens,
 	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
@@ -456,6 +498,9 @@ func normaliseTokenStats(tokens TokenStats) TokenStats {
 	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
+	}
+	if tokens.CacheReadTokens == 0 {
+		tokens.CacheReadTokens = tokens.CachedTokens
 	}
 	return tokens
 }
@@ -545,7 +590,17 @@ func DefaultStatsSavePath(authDir string) string {
 }
 
 // AutoSaveInterval is the default interval for periodic statistics persistence.
-const AutoSaveInterval = 5 * time.Minute
+// Set via SetAutoSaveInterval; defaults to 5 minutes.
+var AutoSaveInterval = 5 * time.Minute
+
+// SetAutoSaveInterval updates the global auto-save interval. An interval <= 0
+// resets to the default of 5 minutes.
+func SetAutoSaveInterval(d time.Duration) {
+	if d <= 0 {
+		d = 5 * time.Minute
+	}
+	AutoSaveInterval = d
+}
 
 // StartAutoSave launches a background goroutine that periodically persists the
 // default statistics store to path. The goroutine exits when ctx is cancelled.

@@ -69,6 +69,14 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageStatisticsSaveIntervalSec overrides the auto-save interval (in seconds) for usage
+	// statistics persistence. When <= 0, the default of 300 (5 minutes) is used.
+	UsageStatisticsSaveIntervalSec int `yaml:"usage-statistics-save-interval-sec" json:"usage-statistics-save-interval-sec"`
+
+	// UsageStatisticsMaxDetailsPerModel overrides the per-model detail retention limit.
+	// When <= 0, the default of 2000 is used.
+	UsageStatisticsMaxDetailsPerModel int `yaml:"usage-statistics-max-details-per-model" json:"usage-statistics-max-details-per-model"`
+
 	// RedisUsageQueueRetentionSeconds controls how long (in seconds) usage queue items
 	// are retained in memory for the Redis RESP interface (LPOP/RPOP).
 	// Default: 60. Max: 3600.
