@@ -54,8 +54,12 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	}
 
 	// allowClampUnsupported determines whether to clamp unsupported levels instead of returning an error.
-	// Always clamp for level-only/hybrid models: the nearest valid level is always acceptable, and
-	// strict rejection was blocking openai-compat models whose registry info may be inaccurate.
+	// Always clamp for level-only/hybrid models: the nearest valid level is always acceptable.
+	// This was relaxed from "toHasLevelSupport && !isSameProviderFamily(fromFormat, toFormat)" to
+	// unconditional "toHasLevelSupport". Reasoning: strict rejection was blocking openai-compat models
+	// whose registry info may be inaccurate (e.g. DeepSeek reporting partial capability). The trade-off
+	// is that same-family conversions that previously returned hard errors now silently accept the
+	// closest supported level instead.
 	toCapability := detectModelCapability(modelInfo)
 	toHasLevelSupport := toCapability == CapabilityLevelOnly || toCapability == CapabilityHybrid
 	allowClampUnsupported := toHasLevelSupport

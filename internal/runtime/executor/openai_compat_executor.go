@@ -137,10 +137,18 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
 
+	// Save user-requested reasoning_effort before ApplyThinking clamps it.
+	// DeepSeek models support levels (xhigh/max) that the registry may
+	// under-report, so we restore the original value after ApplyThinking.
+	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
+
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
+
+	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
+	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -150,21 +158,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			translated = updated
 		}
 	}
-
-	// Save original reasoning_effort before ApplyThinking clamps it.
-	// DeepSeek models support xhigh/max but the registry may not include it.
-	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
-
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
-	}
-
-	// Restore DeepSeek reasoning_effort clamped by ApplyThinking; upstream
-	// DeepSeek APIs support levels (xhigh/max) the registry may under-report.
-	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
-
-	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
