@@ -158,6 +158,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 
+	// Save original reasoning_effort before ApplyThinking clamps it.
+	// DeepSeek models support xhigh/max but the registry may not include it.
+	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
+
+	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
+
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
@@ -168,19 +174,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
-
-	// Save original reasoning_effort before ApplyThinking clamps it.
-	// DeepSeek models support xhigh/max but the registry may not include it.
-	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
-
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
-	}
-
-	// Restore DeepSeek reasoning_effort clamped by ApplyThinking; upstream
-	// DeepSeek APIs support levels (xhigh/max) the registry may under-report.
-	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
 
 	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
