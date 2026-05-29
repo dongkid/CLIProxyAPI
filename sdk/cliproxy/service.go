@@ -774,6 +774,15 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	statsPath := internalusage.DefaultStatsSavePath(s.cfg.AuthDir)
+
+	// Apply config-driven overrides for statistics tuning.
+	if s.cfg.UsageStatisticsSaveIntervalSec > 0 {
+		internalusage.SetAutoSaveInterval(time.Duration(s.cfg.UsageStatisticsSaveIntervalSec) * time.Second)
+	}
+	if s.cfg.UsageStatisticsMaxDetailsPerModel > 0 {
+		internalusage.SetMaxDetailsPerModel(s.cfg.UsageStatisticsMaxDetailsPerModel)
+	}
+
 	if err := internalusage.GetRequestStatistics().LoadFromFile(statsPath); err != nil {
 		log.Warnf("usage: failed to load persisted statistics: %v", err)
 	}

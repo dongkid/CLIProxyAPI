@@ -93,7 +93,16 @@ type modelStats struct {
 
 // MaxDetailsPerModel limits the number of stored request details per model
 // to prevent unbounded memory growth. Once exceeded, the oldest entries are trimmed.
-const MaxDetailsPerModel = 2000
+// Set via SetMaxDetailsPerModel; defaults to 2000.
+var MaxDetailsPerModel = 2000
+
+// SetMaxDetailsPerModel updates the global detail retention limit. A value <= 0
+// leaves the current value unchanged.
+func SetMaxDetailsPerModel(n int) {
+	if n > 0 {
+		MaxDetailsPerModel = n
+	}
+}
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
@@ -545,7 +554,16 @@ func DefaultStatsSavePath(authDir string) string {
 }
 
 // AutoSaveInterval is the default interval for periodic statistics persistence.
-const AutoSaveInterval = 5 * time.Minute
+// Set via SetAutoSaveInterval; defaults to 5 minutes.
+var AutoSaveInterval = 5 * time.Minute
+
+// SetAutoSaveInterval updates the global auto-save interval. An interval <= 0
+// leaves the current value unchanged.
+func SetAutoSaveInterval(d time.Duration) {
+	if d > 0 {
+		AutoSaveInterval = d
+	}
+}
 
 // StartAutoSave launches a background goroutine that periodically persists the
 // default statistics store to path. The goroutine exits when ctx is cancelled.
