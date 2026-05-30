@@ -364,6 +364,9 @@ type PayloadModelRule struct {
 	Exist []string `yaml:"exist" json:"exist"`
 	// NotExist requires payload JSON paths to be missing or null.
 	NotExist []string `yaml:"not-exist" json:"not-exist"`
+	// SupportsMultimodal indicates whether the model supports multimodal inputs (images, files, etc.).
+	// nil = no filtering (default), false = strip multimodal content, true = explicitly supports.
+	SupportsMultimodal *bool `yaml:"supports-multimodal" json:"supports_multimodal"`
 }
 
 // CloakConfig configures request cloaking for non-Claude-Code clients.

@@ -43,6 +43,9 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 		}
 	}
 
+	// Apply multimodal filtering for models explicitly marked as non-multimodal.
+	out = applyMultimodalFilter(cfg, model, requestedModel, protocol, out, root)
+
 	rules := cfg.Payload
 	hasPayloadRules := len(rules.Default) != 0 || len(rules.DefaultRaw) != 0 || len(rules.Override) != 0 || len(rules.OverrideRaw) != 0 || len(rules.Filter) != 0
 	if hasPayloadRules {
@@ -970,4 +973,285 @@ func OpenCodeSessionID(sessionID string) string {
 	hash := sha256.Sum256([]byte(sessionID))
 	hexStr := hex.EncodeToString(hash[:])
 	return "ses_" + hexStr[:12] + hexStr[12:26]
+}
+
+const multimodalWarning = "\n\n[System Notice: The current model does not support multimodal inputs (images, files, etc.). The attached images/files in your original request have been automatically removed. Please use a model that supports vision/multimodal capabilities, or ask the user for text-based alternatives.]"
+
+var openAIChatMultimodalTypes = map[string]bool{
+	"image_url":   true,
+	"input_audio": true,
+	"file":        true,
+}
+
+var openAIResponsesMultimodalTypes = map[string]bool{
+	"input_image": true,
+	"input_file":  true,
+}
+
+var claudeMultimodalTypes = map[string]bool{
+	"image":    true,
+	"file":     true,
+	"document": true,
+}
+
+var codexMultimodalTypes = map[string]bool{
+	"input_image": true,
+}
+
+func applyMultimodalFilter(cfg *config.Config, model, requestedModel, protocol string, payload []byte, root string) []byte {
+	if cfg == nil || len(payload) == 0 {
+		return payload
+	}
+	rules := collectNonMultimodalRules(cfg)
+	if len(rules) == 0 {
+		return payload
+	}
+	model = strings.TrimSpace(model)
+	requestedModel = strings.TrimSpace(requestedModel)
+	if model == "" && requestedModel == "" {
+		return payload
+	}
+	candidates := payloadModelCandidates(model, requestedModel)
+	if !isNonMultimodalModel(rules, protocol, candidates) {
+		return payload
+	}
+	out, _ := stripMultimodalContent(payload, protocol, root)
+	return out
+}
+
+func collectNonMultimodalRules(cfg *config.Config) []config.PayloadModelRule {
+	var rules []config.PayloadModelRule
+	collect := func(ruleList []config.PayloadRule) {
+		for _, rule := range ruleList {
+			for _, mr := range rule.Models {
+				if mr.SupportsMultimodal != nil && !*mr.SupportsMultimodal {
+					rules = append(rules, mr)
+				}
+			}
+		}
+	}
+	collectFilter := func(ruleList []config.PayloadFilterRule) {
+		for _, rule := range ruleList {
+			for _, mr := range rule.Models {
+				if mr.SupportsMultimodal != nil && !*mr.SupportsMultimodal {
+					rules = append(rules, mr)
+				}
+			}
+		}
+	}
+	collect(cfg.Payload.Default)
+	collect(cfg.Payload.DefaultRaw)
+	collect(cfg.Payload.Override)
+	collect(cfg.Payload.OverrideRaw)
+	collectFilter(cfg.Payload.Filter)
+	return rules
+}
+
+func isNonMultimodalModel(rules []config.PayloadModelRule, protocol string, candidates []string) bool {
+	for _, candidate := range candidates {
+		for _, rule := range rules {
+			name := strings.TrimSpace(rule.Name)
+			if name == "" {
+				continue
+			}
+			if !matchModelPattern(name, candidate) {
+				continue
+			}
+			if ep := strings.TrimSpace(rule.Protocol); ep != "" && protocol != "" && !strings.EqualFold(ep, protocol) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func stripMultimodalContent(payload []byte, protocol, root string) ([]byte, bool) {
+	prefix := ""
+	if r := strings.TrimSpace(root); r != "" {
+		prefix = r + "."
+	}
+	norm := strings.ToLower(strings.TrimSpace(protocol))
+	switch {
+	case norm == "openai":
+		return stripMessagesMultimodal(payload, prefix, openAIChatMultimodalTypes, "text")
+	case norm == "openai-response":
+		return stripCodexMultimodal(payload, prefix, openAIResponsesMultimodalTypes)
+	case norm == "claude":
+		return stripMessagesMultimodal(payload, prefix, claudeMultimodalTypes, "text")
+	case norm == "gemini" || norm == "gemini-cli" || norm == "antigravity":
+		return stripGeminiMultimodal(payload, prefix)
+	case norm == "codex":
+		return stripCodexMultimodal(payload, prefix, codexMultimodalTypes)
+	default:
+		return payload, false
+	}
+}
+
+func stripMessagesMultimodal(payload []byte, prefix string, multimodalTypes map[string]bool, textType string) ([]byte, bool) {
+	messages := gjson.GetBytes(payload, prefix+"messages")
+	if !messages.IsArray() {
+		return payload, false
+	}
+	out := payload
+	modified := false
+	for i := 0; i < len(messages.Array()); i++ {
+		contentPath := fmt.Sprintf("%smessages.%d.content", prefix, i)
+		content := gjson.GetBytes(out, contentPath)
+		if !content.IsArray() {
+			continue
+		}
+		hasMultimodal := false
+		var textParts []string
+		content.ForEach(func(_, part gjson.Result) bool {
+			partType := part.Get("type").String()
+			if multimodalTypes[partType] {
+				hasMultimodal = true
+				return true
+			}
+			if partType == textType {
+				textParts = append(textParts, part.Get("text").String())
+				return true
+			}
+			if partType == "tool_result" {
+				toolText, toolHasImage := extractToolResultText(part, multimodalTypes)
+				if toolText != "" {
+					textParts = append(textParts, toolText)
+				}
+				if toolHasImage {
+					hasMultimodal = true
+				}
+			}
+			return true
+		})
+		if !hasMultimodal {
+			continue
+		}
+		newText := strings.Join(textParts, "\n")
+		if newText != "" {
+			newText += "\n\n"
+		}
+		newText += multimodalWarning
+		var err error
+		out, err = sjson.SetBytes(out, contentPath, newText)
+		if err != nil {
+			continue
+		}
+		modified = true
+	}
+	return out, modified
+}
+
+func extractToolResultText(part gjson.Result, multimodalTypes map[string]bool) (string, bool) {
+	toolContent := part.Get("content")
+	if toolContent.Type == gjson.String {
+		return toolContent.String(), false
+	}
+	if !toolContent.IsArray() {
+		return "", false
+	}
+	var texts []string
+	hasMedia := false
+	toolContent.ForEach(func(_, sub gjson.Result) bool {
+		subType := sub.Get("type").String()
+		if multimodalTypes[subType] {
+			hasMedia = true
+			return true
+		}
+		if subType == "text" {
+			if t := sub.Get("text").String(); t != "" {
+				texts = append(texts, t)
+			}
+		}
+		return true
+	})
+	return strings.Join(texts, "\n"), hasMedia
+}
+
+func stripGeminiMultimodal(payload []byte, prefix string) ([]byte, bool) {
+	contents := gjson.GetBytes(payload, prefix+"contents")
+	if !contents.IsArray() {
+		return payload, false
+	}
+	out := payload
+	modified := false
+	for i := 0; i < len(contents.Array()); i++ {
+		partsPath := fmt.Sprintf("%scontents.%d.parts", prefix, i)
+		parts := gjson.GetBytes(out, partsPath)
+		if !parts.IsArray() {
+			continue
+		}
+		hasMultimodal := false
+		var textParts []string
+		parts.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("inlineData").Exists() || part.Get("fileData").Exists() {
+				hasMultimodal = true
+				return true
+			}
+			if text := part.Get("text").String(); text != "" {
+				textParts = append(textParts, text)
+			}
+			return true
+		})
+		if !hasMultimodal {
+			continue
+		}
+		newText := strings.Join(textParts, "\n")
+		if newText != "" {
+			newText += "\n\n"
+		}
+		newText += multimodalWarning
+		newParts := []map[string]string{{"text": newText}}
+		var err error
+		out, err = sjson.SetBytes(out, partsPath, newParts)
+		if err != nil {
+			continue
+		}
+		modified = true
+	}
+	return out, modified
+}
+
+func stripCodexMultimodal(payload []byte, prefix string, multimodalTypes map[string]bool) ([]byte, bool) {
+	input := gjson.GetBytes(payload, prefix+"input")
+	if !input.IsArray() {
+		return payload, false
+	}
+	out := payload
+	modified := false
+	for i := 0; i < len(input.Array()); i++ {
+		contentPath := fmt.Sprintf("%sinput.%d.content", prefix, i)
+		content := gjson.GetBytes(out, contentPath)
+		if !content.IsArray() {
+			continue
+		}
+		hasMultimodal := false
+		var textParts []string
+		content.ForEach(func(_, part gjson.Result) bool {
+			partType := part.Get("type").String()
+			if multimodalTypes[partType] {
+				hasMultimodal = true
+				return true
+			}
+			if partType == "input_text" {
+				textParts = append(textParts, part.Get("text").String())
+			}
+			return true
+		})
+		if !hasMultimodal {
+			continue
+		}
+		newText := strings.Join(textParts, "\n")
+		if newText != "" {
+			newText += "\n\n"
+		}
+		newText += multimodalWarning
+		var err error
+		out, err = sjson.SetBytes(out, contentPath, newText)
+		if err != nil {
+			continue
+		}
+		modified = true
+	}
+	return out, modified
 }

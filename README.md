@@ -14,6 +14,7 @@ So you can use local or multi-account CLI access with OpenAI(include Responses)/
 > - Persistent usage statistics (auto-save/load, survives restarts)
 > - OpenCode Go session tracking via `x-opencode-session` header (configurable per-provider)
 > - Config-driven session-affinity header forwarding for OpenAI-compat providers
+> - Multimodal support configuration (`supports-multimodal` per-model flag: `nil`=no filtering, `false`=strip images/files with notice, `true`=explicitly supported)
 
 ## Sponsor
 

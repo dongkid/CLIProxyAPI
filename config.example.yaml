@@ -403,6 +403,7 @@ nonstream-keepalive-interval: 0
 #             - "tools.#(type==\"web_search\").type"
 #           not-exist: # all payload JSON paths must be missing or null
 #             - "metadata.disable_payload"
+#           supports-multimodal: false # optional: when false, images/files are replaced with a notice
 #       params: # JSON path (gjson/sjson syntax) -> value
 #         "generationConfig.thinkingConfig.thinkingBudget": 32768
 #   default-raw: # Default raw rules set parameters using raw JSON when missing (must be valid JSON).

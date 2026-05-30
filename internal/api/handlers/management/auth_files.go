@@ -27,6 +27,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/opencode"
+
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -2600,6 +2602,160 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+// opencodeDiscoverRequest is the request body for discovering OpenCode API keys.
+type opencodeDiscoverRequest struct {
+	Cookie      string `json:"cookie" binding:"required"`
+	WorkspaceID string `json:"workspace_id"`
+}
+
+// opencodeSaveRequest is the request body for saving an OpenCode API key.
+type opencodeSaveRequest struct {
+	Cookie      string `json:"cookie" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
+	KeyID       string `json:"key_id" binding:"required"`
+	KeyName     string `json:"key_name"`
+}
+
+// RequestOpenCodeToken discovers API keys from OpenCode using the user's browser cookie.
+func (h *Handler) RequestOpenCodeToken(c *gin.Context) {
+	var req opencodeDiscoverRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cookie is required"})
+		return
+	}
+
+	cookie := strings.TrimSpace(req.Cookie)
+	if cookie == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cookie is required"})
+		return
+	}
+	if !strings.HasPrefix(cookie, "auth=") {
+		cookie = "auth=" + cookie
+	}
+
+	client := opencode.NewClient(h.cfg)
+	wspID := strings.TrimSpace(req.WorkspaceID)
+
+	if wspID == "" {
+		discovered, err := opencode.DiscoverWorkspace(client, cookie)
+		if err != nil {
+			log.Warnf("opencode: workspace auto-discovery failed: %v", err)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":               "workspace_id is required for auto-discovery",
+				"needs_workspace_id":  true,
+				"hint":                "OpenCode is a single-page app — workspace ID cannot be auto-discovered via HTTP. Please copy it from your browser URL bar (e.g. /workspace/wrk_xxx).",
+			})
+			return
+		}
+		wspID = discovered
+	}
+
+	keys, err := opencode.ExtractKeys(client, cookie, wspID)
+	if err != nil {
+		log.Errorf("opencode: failed to extract keys: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to extract API keys: " + err.Error()})
+		return
+	}
+
+	if len(keys) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no API keys found in workspace"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"workspace_id": wspID,
+		"keys":         keys,
+	})
+}
+
+// SaveOpenCodeToken saves an OpenCode API key via the standard saveTokenRecord flow.
+func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
+	var req opencodeSaveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cookie, workspace_id, and key_id are required"})
+		return
+	}
+
+	cookie := strings.TrimSpace(req.Cookie)
+	if cookie == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cookie is required"})
+		return
+	}
+	if !strings.HasPrefix(cookie, "auth=") {
+		cookie = "auth=" + cookie
+	}
+
+	client := opencode.NewClient(h.cfg)
+
+	keys, err := opencode.ExtractKeys(client, cookie, req.WorkspaceID)
+	if err != nil {
+		log.Errorf("opencode save: failed to extract keys: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to extract keys: " + err.Error()})
+		return
+	}
+
+	var targetKey *opencode.KeyEntry
+	for i := range keys {
+		if keys[i].ID == req.KeyID {
+			targetKey = &keys[i]
+			break
+		}
+	}
+	if targetKey == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+		return
+	}
+
+	keyName := req.KeyName
+	if keyName == "" {
+		keyName = targetKey.Name
+	}
+
+	fileName, err := opencode.CredentialFileName(h.cfg.AuthDir, keyName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename: " + err.Error()})
+		return
+	}
+
+	now := time.Now().UTC()
+	record := &coreauth.Auth{
+		ID:        fileName,
+		Provider:  "opencode",
+		FileName:  fileName,
+		Label:     keyName,
+		Status:    coreauth.StatusActive,
+		Storage: &opencode.TokenStorage{
+			Type:      "opencode",
+			Label:     keyName,
+			Key:       targetKey.Key,
+			Workspace: req.WorkspaceID,
+		},
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Attributes: map[string]string{
+			"key_display": targetKey.Display,
+			"workspace":   req.WorkspaceID,
+		},
+	}
+
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+	savedPath, err := h.saveTokenRecord(ctx, record)
+	if err != nil {
+		log.Errorf("opencode save: failed to save token record: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save key: " + err.Error()})
+		return
+	}
+
+	log.Infof("opencode: saved API key to %s", savedPath)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"file":   fileName,
+		"key":    targetKey.Display,
+	})
 }
 
 type projectSelectionRequiredError struct{}
