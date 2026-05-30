@@ -2607,7 +2607,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 // opencodeDiscoverRequest is the request body for discovering OpenCode API keys.
 type opencodeDiscoverRequest struct {
 	Cookie      string `json:"cookie" binding:"required"`
-	WorkspaceID string `json:"workspace_id"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 }
 
 // opencodeSaveRequest is the request body for saving an OpenCode API key.
@@ -2637,19 +2637,9 @@ func (h *Handler) RequestOpenCodeToken(c *gin.Context) {
 
 	client := opencode.NewClient(h.cfg)
 	wspID := strings.TrimSpace(req.WorkspaceID)
-
 	if wspID == "" {
-		discovered, err := opencode.DiscoverWorkspace(client, cookie)
-		if err != nil {
-			log.Warnf("opencode: workspace auto-discovery failed: %v", err)
-			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":               "workspace_id is required for auto-discovery",
-				"needs_workspace_id":  true,
-				"hint":                "OpenCode is a single-page app — workspace ID cannot be auto-discovered via HTTP. Please copy it from your browser URL bar (e.g. /workspace/wrk_xxx).",
-			})
-			return
-		}
-		wspID = discovered
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+		return
 	}
 
 	keys, err := opencode.ExtractKeys(client, cookie, wspID)

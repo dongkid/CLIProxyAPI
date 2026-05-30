@@ -24,46 +24,6 @@ func NewClient(cfg *config.Config) *http.Client {
 	return client
 }
 
-// DiscoverWorkspace discovers the workspace ID.
-// OpenCode is a SolidJS SPA — /workspace uses client-side JS redirect, not HTTP 3xx.
-// Strategy: 1) follow HTTP redirect, 2) scan HTML body for wrk_ patterns,
-// 3) return a clear error telling the user to provide workspace_id manually.
-func DiscoverWorkspace(client *http.Client, cookie string) (string, error) {
-	req, err := http.NewRequest("GET", "https://opencode.ai/workspace", nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("User-Agent", "CPA/1.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Strategy 1: extract workspace ID from the final request URL (HTTP redirect)
-	finalURL := resp.Request.URL.String()
-	for _, part := range strings.Split(strings.TrimRight(finalURL, "/"), "/") {
-		if strings.HasPrefix(part, "wrk_") {
-			return part, nil
-		}
-	}
-
-	// Strategy 2: scan HTML body for wrk_ patterns (SSR data or links)
-	body, _ := io.ReadAll(resp.Body)
-	html := string(body)
-	wrkRe := regexp.MustCompile(`wrk_[a-zA-Z0-9]+`)
-	if m := wrkRe.FindString(html); m != "" {
-		return m, nil
-	}
-
-	// Strategy 3: neither worked — OpenCode SPA requires JS execution
-	return "", fmt.Errorf(
-		"auto-discovery failed. OpenCode uses client-side redirect, please provide workspace_id manually. "+
-			"You can find it in the browser URL bar when on opencode.ai: /workspace/<b>wrk_xxx</b>")
-}
-
 // ExtractKeys extracts API keys from OpenCode's workspace keys page SSR HTML.
 func ExtractKeys(client *http.Client, cookie, wspID string) ([]KeyEntry, error) {
 	keysURL := fmt.Sprintf("https://opencode.ai/workspace/%s/keys", wspID)
