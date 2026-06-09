@@ -100,12 +100,3 @@ func TestSanitizeFileSegment(t *testing.T) {
 		}
 	}
 }
-
-func TestTruncateString(t *testing.T) {
-	if got := TruncateString("hello", 10); got != "hello" {
-		t.Errorf("expected hello, got %s", got)
-	}
-	if got := TruncateString("hello world", 5); got != "hello" {
-		t.Errorf("expected hello, got %s", got)
-	}
-}

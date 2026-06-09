@@ -2611,11 +2611,14 @@ type opencodeDiscoverRequest struct {
 }
 
 // opencodeSaveRequest is the request body for saving an OpenCode API key.
+// When api_key is provided directly, it skips the cookie-based key extraction
+// (which may fail due to Cloudflare blocking non-browser TLS fingerprints).
 type opencodeSaveRequest struct {
-	Cookie      string `json:"cookie" binding:"required"`
-	WorkspaceID string `json:"workspace_id" binding:"required"`
-	KeyID       string `json:"key_id" binding:"required"`
+	Cookie      string `json:"cookie"`
+	WorkspaceID string `json:"workspace_id"`
+	KeyID       string `json:"key_id"`
 	KeyName     string `json:"key_name"`
+	APIKey      string `json:"api_key"`
 }
 
 // RequestOpenCodeToken discovers API keys from OpenCode using the user's browser cookie.
@@ -2661,6 +2664,9 @@ func (h *Handler) RequestOpenCodeToken(c *gin.Context) {
 }
 
 // SaveOpenCodeToken saves an OpenCode API key via the standard saveTokenRecord flow.
+// Supports two modes:
+//  1. Cookie-based: provide cookie + workspace_id + key_id to extract via SSR HTML
+//  2. Direct: provide api_key + key_name to save directly (bypasses Cloudflare TLS check)
 func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 	var req opencodeSaveRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2668,39 +2674,58 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 		return
 	}
 
-	cookie := strings.TrimSpace(req.Cookie)
-	if cookie == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cookie is required"})
-		return
-	}
-	if !strings.HasPrefix(cookie, "auth=") {
-		cookie = "auth=" + cookie
-	}
-
 	client := opencode.NewClient(h.cfg)
 
-	keys, err := opencode.ExtractKeys(client, cookie, req.WorkspaceID)
-	if err != nil {
-		log.Errorf("opencode save: failed to extract keys: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to extract keys: " + err.Error()})
-		return
-	}
-
 	var targetKey *opencode.KeyEntry
-	for i := range keys {
-		if keys[i].ID == req.KeyID {
-			targetKey = &keys[i]
-			break
-		}
-	}
-	if targetKey == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
-		return
-	}
-
 	keyName := req.KeyName
-	if keyName == "" {
-		keyName = targetKey.Name
+
+	// Mode 1: Direct API key input (bypasses Cloudflare-blocked cookie extraction)
+	if req.APIKey != "" {
+		if keyName == "" {
+			keyName = "OpenCode API Key"
+		}
+		// Verify the key if possible, but don't block on failure
+		if err := opencode.VerifyKey(client, req.APIKey); err != nil {
+			log.Warnf("opencode: api key verification warning: %v", err)
+		}
+		targetKey = &opencode.KeyEntry{
+			ID:      "direct",
+			Name:    keyName,
+			Key:     req.APIKey,
+			Display: req.APIKey[:7] + "..." + req.APIKey[len(req.APIKey)-4:],
+		}
+	} else {
+		// Mode 2: Cookie-based key extraction
+		cookie := strings.TrimSpace(req.Cookie)
+		if cookie == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "cookie is required when api_key is not provided"})
+			return
+		}
+		if !strings.HasPrefix(cookie, "auth=") {
+			cookie = "auth=" + cookie
+		}
+
+		keys, err := opencode.ExtractKeys(client, cookie, req.WorkspaceID)
+		if err != nil {
+			log.Errorf("opencode save: failed to extract keys: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to extract keys: " + err.Error()})
+			return
+		}
+
+		for i := range keys {
+			if keys[i].ID == req.KeyID {
+				targetKey = &keys[i]
+				break
+			}
+		}
+		if targetKey == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+			return
+		}
+
+		if keyName == "" {
+			keyName = targetKey.Name
+		}
 	}
 
 	fileName, err := opencode.CredentialFileName(h.cfg.AuthDir, keyName)
@@ -2710,6 +2735,17 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
+	wspID := req.WorkspaceID
+	if wspID == "" {
+		wspID = "direct"
+	}
+	cookieToSave := ""
+	if req.Cookie != "" {
+		cookieToSave = strings.TrimSpace(req.Cookie)
+		if !strings.HasPrefix(cookieToSave, "auth=") {
+			cookieToSave = "auth=" + cookieToSave
+		}
+	}
 	record := &coreauth.Auth{
 		ID:        fileName,
 		Provider:  "opencode",
@@ -2720,13 +2756,14 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 			Type:      "opencode",
 			Label:     keyName,
 			Key:       targetKey.Key,
-			Workspace: req.WorkspaceID,
+			Workspace: wspID,
+			Cookie:    cookieToSave,
 		},
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		Attributes: map[string]string{
 			"key_display": targetKey.Display,
-			"workspace":   req.WorkspaceID,
+			"workspace":   wspID,
 		},
 	}
 

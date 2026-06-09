@@ -25,6 +25,7 @@ type TokenStorage struct {
 	Label     string `json:"label"`
 	Key       string `json:"key"`
 	Workspace string `json:"workspace,omitempty"`
+	Cookie    string `json:"cookie,omitempty"`
 
 	Metadata map[string]any `json:"-"`
 }

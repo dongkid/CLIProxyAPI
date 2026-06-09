@@ -58,3 +58,5 @@ data/*
 .gocache/
 management.html
 link-management.ps1
+temp*
+test*
