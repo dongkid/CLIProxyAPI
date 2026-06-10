@@ -73,10 +73,12 @@ func (e *OpenAICompatExecutor) resolveCompatEntry() *config.OpenAICompatibility 
 // session tracking and cache affinity.
 func (e *OpenAICompatExecutor) isOpenCodeProvider() bool {
 	compat := e.resolveCompatEntry()
-	if compat == nil {
-		return false
+	if compat != nil {
+		return strings.Contains(compat.BaseURL, "opencode.ai")
 	}
-	return strings.Contains(compat.BaseURL, "opencode.ai")
+	// Fallback: auth-file-based OpenCode credentials don't go through
+	// the OpenAICompatibility config path but still target opencode.ai.
+	return strings.EqualFold(e.provider, "opencode")
 }
 
 // sessionAffinityHeaderName returns the configured session-affinity HTTP header
@@ -825,6 +827,16 @@ func (e *OpenAICompatExecutor) resolveCredentials(auth *cliproxyauth.Auth) (base
 	if auth.Attributes != nil {
 		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
 		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+	}
+	// Fallback: OpenCode Go uses a fixed base URL.
+	if baseURL == "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "opencode") {
+		baseURL = "https://opencode.ai/zen/go/v1"
+	}
+	// Fallback: older auth files store the key in Metadata, not Attributes.
+	if apiKey == "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "opencode") && auth.Metadata != nil {
+		if v, ok := auth.Metadata["key"].(string); ok {
+			apiKey = strings.TrimSpace(v)
+		}
 	}
 	return
 }

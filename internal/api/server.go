@@ -712,6 +712,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/opencode-save", s.mgmt.SaveOpenCodeToken)
 		mgmt.POST("/opencode-go-usage", s.mgmt.FetchOpenCodeGoUsage)
 		mgmt.POST("/opencode-models", s.mgmt.FetchOpenCodeModels)
+		mgmt.POST("/opencode-workspaces", s.mgmt.FetchOpenCodeWorkspaces)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}

@@ -98,7 +98,7 @@ func (OpenCodeAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		label = "OpenCode Go"
 	}
 
-	fileName, err := opencode.CredentialFileName(cfg.AuthDir, label)
+	fileName, err := opencode.CredentialFileName(cfg.AuthDir, label, shortWspID(wspID))
 	if err != nil {
 		return nil, fmt.Errorf("opencode: filename generation failed: %w", err)
 	}
@@ -144,6 +144,7 @@ func (OpenCodeAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		Attributes: map[string]string{
 			"api_key":     selectedKey.Key,
 			"key_display": selectedKey.Display,
+			"base_url":    "https://opencode.ai/zen/go/v1",
 			"workspace":   wspID,
 		},
 		CreatedAt: now,
@@ -179,4 +180,15 @@ func metaOrEmpty(m map[string]string, key string) string {
 		return ""
 	}
 	return m[key]
+}
+
+func shortWspID(wspID string) string {
+	if wspID == "" || wspID == "direct" {
+		return ""
+	}
+	id := strings.TrimPrefix(wspID, "wrk_")
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	return "wrk" + id
 }

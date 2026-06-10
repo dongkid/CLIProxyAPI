@@ -15,6 +15,29 @@ type opencodeFetchGoUsageRequest struct {
 	WorkspaceID string `json:"workspace_id" binding:"required"`
 }
 
+// FetchOpenCodeWorkspaces discovers workspaces from the OpenCode SSR HTML using the auth cookie.
+func (h *Handler) FetchOpenCodeWorkspaces(c *gin.Context) {
+	var req struct {
+		Cookie string `json:"cookie" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cookie is required"})
+		return
+	}
+	cookie := strings.TrimSpace(req.Cookie)
+	if !strings.HasPrefix(cookie, "auth=") {
+		cookie = "auth=" + cookie
+	}
+	client := opencode.NewClient(h.cfg)
+	workspaces, err := opencode.ExtractWorkspaces(client, cookie)
+	if err != nil {
+		log.Errorf("opencode: failed to discover workspaces: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to discover workspaces: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"workspaces": workspaces, "count": len(workspaces)})
+}
+
 // FetchOpenCodeGoUsage retrieves Go plan usage data from the OpenCode SSR HTML page.
 func (h *Handler) FetchOpenCodeGoUsage(c *gin.Context) {
 	var req opencodeFetchGoUsageRequest

@@ -9,21 +9,34 @@ import (
 )
 
 // CredentialFileName generates a collision-free filename for an OpenCode key.
-// Returns "opencode-<sanitized_label>.json" or "opencode-<timestamp>.json" if empty.
+// The wspSuffix is an optional short workspace identifier to disambiguate files
+// from different workspaces (e.g., "wrk01"). Pass "" to skip.
+// Returns "opencode-<sanitized_label>[-<wspSuffix>].json" or "opencode-<timestamp>.json" if empty.
 // If the target file already exists, appends a counter: "opencode-<label>-2.json".
-func CredentialFileName(baseDir, label string) (string, error) {
+func CredentialFileName(baseDir, label, wspSuffix string) (string, error) {
 	name := sanitizeFileSegment(label)
 	if name == "" {
 		name = fmt.Sprintf("%d", time.Now().UnixMilli())
 	}
-	fileName := fmt.Sprintf("opencode-%s.json", name)
+	wspSuffix = sanitizeFileSegment(wspSuffix)
+	var fileName string
+	if wspSuffix != "" {
+		fileName = fmt.Sprintf("opencode-%s-%s.json", name, wspSuffix)
+	} else {
+		fileName = fmt.Sprintf("opencode-%s.json", name)
+	}
 	fullPath := filepath.Join(baseDir, fileName)
 
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 		return fileName, nil
 	}
 	for i := 2; i <= 99; i++ {
-		candidate := fmt.Sprintf("opencode-%s-%d.json", name, i)
+		var candidate string
+		if wspSuffix != "" {
+			candidate = fmt.Sprintf("opencode-%s-%s-%d.json", name, wspSuffix, i)
+		} else {
+			candidate = fmt.Sprintf("opencode-%s-%d.json", name, i)
+		}
 		if _, err := os.Stat(filepath.Join(baseDir, candidate)); os.IsNotExist(err) {
 			return candidate, nil
 		}

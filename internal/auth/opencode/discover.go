@@ -161,6 +161,107 @@ func VerifyKey(client *http.Client, apiKey string) error {
 	return nil
 }
 
+// WorkspaceEntry represents a workspace from OpenCode's SSR HTML.
+type WorkspaceEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ExtractWorkspaces extracts the list of workspaces from OpenCode SSR HTML.
+// Tries multiple pages: first the product page (/go) to get any workspace ID,
+// then the workspace keys page to get the full list with names.
+func ExtractWorkspaces(client *http.Client, cookie string) ([]WorkspaceEntry, error) {
+	// Strategy 1: Try /go page — may have workspace IDs in SSR (but no names)
+	entries, _ := fetchAndParseWorkspaces(client, cookie, "https://opencode.ai/go")
+	if len(entries) > 0 {
+		return entries, nil
+	}
+
+	// Strategy 2: Extract any wrk_ ID from /go, then use it to fetch full list
+	wrkID := extractAnyWorkspaceID(client, cookie)
+	if wrkID == "" {
+		return nil, fmt.Errorf("no workspaces found — cookie may be invalid")
+	}
+
+	keysURL := fmt.Sprintf("https://opencode.ai/workspace/%s/keys", wrkID)
+	entries, err := fetchAndParseWorkspaces(client, cookie, keysURL)
+	if err == nil && len(entries) > 0 {
+		return entries, nil
+	}
+
+	// Fallback: return the single workspace we found
+	return []WorkspaceEntry{{ID: wrkID, Name: "Default"}}, nil
+}
+
+func extractAnyWorkspaceID(client *http.Client, cookie string) string {
+	req, _ := http.NewRequest("GET", "https://opencode.ai/go", nil)
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("User-Agent", "CPA/1.0")
+	req.Header.Set("Accept", "text/html")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	re := regexp.MustCompile(`(wrk_[a-zA-Z0-9]{10,40})`)
+	m := re.FindStringSubmatch(string(body))
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+func fetchAndParseWorkspaces(client *http.Client, cookie, url string) ([]WorkspaceEntry, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("User-Agent", "CPA/1.0")
+	req.Header.Set("Accept", "text/html")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return extractWorkspacesFromHTML(string(body))
+}
+
+func extractWorkspacesFromHTML(html string) ([]WorkspaceEntry, error) {
+	// SolidJS SSR serialization: {id:"wrk_xxx",name:"Name",slug:null}
+	re := regexp.MustCompile(`\{id:"(wrk_[a-zA-Z0-9]+)",name:"([^"]*)",slug:\w+\}`)
+	matches := re.FindAllStringSubmatch(html, -1)
+	if len(matches) == 0 {
+		// Fallback: {id:"wrk_xxx",name:"Name"}
+		re2 := regexp.MustCompile(`\{id:"(wrk_[a-zA-Z0-9]+)",name:"([^"]*)"`)
+		matches = re2.FindAllStringSubmatch(html, -1)
+	}
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no workspaces found in SSR HTML — cookie may be invalid")
+	}
+
+	seen := make(map[string]bool)
+	var entries []WorkspaceEntry
+	for _, m := range matches {
+		if len(m) >= 3 && !seen[m[1]] {
+			seen[m[1]] = true
+			entries = append(entries, WorkspaceEntry{ID: m[1], Name: m[2]})
+		}
+	}
+	return entries, nil
+}
+
 // IsAuthError reports whether the error from VerifyKey indicates an authentication
 // failure (401/403) as opposed to a transient network issue.
 func IsAuthError(err error) bool {

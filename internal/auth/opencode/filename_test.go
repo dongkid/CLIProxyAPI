@@ -8,7 +8,7 @@ import (
 
 func TestCredentialFileName_Basic(t *testing.T) {
 	dir := t.TempDir()
-	name, err := CredentialFileName(dir, "Default API Key")
+	name, err := CredentialFileName(dir, "Default API Key", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -17,9 +17,20 @@ func TestCredentialFileName_Basic(t *testing.T) {
 	}
 }
 
+func TestCredentialFileName_WithWspSuffix(t *testing.T) {
+	dir := t.TempDir()
+	name, err := CredentialFileName(dir, "Default API Key", "wrk01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "opencode-default-api-key-wrk01.json" {
+		t.Errorf("expected opencode-default-api-key-wrk01.json, got %s", name)
+	}
+}
+
 func TestCredentialFileName_Empty(t *testing.T) {
 	dir := t.TempDir()
-	name, err := CredentialFileName(dir, "")
+	name, err := CredentialFileName(dir, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,17 +42,16 @@ func TestCredentialFileName_Empty(t *testing.T) {
 func TestCredentialFileName_Collision(t *testing.T) {
 	dir := t.TempDir()
 
-	first, err := CredentialFileName(dir, "test-key")
+	first, err := CredentialFileName(dir, "test-key", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Create the first file to simulate collision
 	if err := os.WriteFile(filepath.Join(dir, first), []byte("{}"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	second, err := CredentialFileName(dir, "test-key")
+	second, err := CredentialFileName(dir, "test-key", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,13 +63,36 @@ func TestCredentialFileName_Collision(t *testing.T) {
 	}
 }
 
-func TestCredentialFileName_SpecialChars(t *testing.T) {
+func TestCredentialFileName_CollisionWithWspSuffix(t *testing.T) {
 	dir := t.TempDir()
-	name, err := CredentialFileName(dir, "中文 Key!@#")
+
+	first, err := CredentialFileName(dir, "test-key", "wrk01")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Non-ASCII chars should be replaced with dashes
+
+	if err := os.WriteFile(filepath.Join(dir, first), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := CredentialFileName(dir, "test-key", "wrk01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Errorf("collision not avoided: both returned %s", first)
+	}
+	if second != "opencode-test-key-wrk01-2.json" {
+		t.Errorf("expected opencode-test-key-wrk01-2.json, got %s", second)
+	}
+}
+
+func TestCredentialFileName_SpecialChars(t *testing.T) {
+	dir := t.TempDir()
+	name, err := CredentialFileName(dir, "中文 Key!@#", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if filepath.Ext(name) != ".json" {
 		t.Errorf("expected .json extension, got %s", name)
 	}
@@ -71,7 +104,7 @@ func TestCredentialFileName_VeryLong(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		longLabel += "a"
 	}
-	name, err := CredentialFileName(dir, longLabel)
+	name, err := CredentialFileName(dir, longLabel, "")
 	if err != nil {
 		t.Fatal(err)
 	}

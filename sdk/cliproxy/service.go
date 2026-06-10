@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/opencode"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -1192,6 +1193,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "xai":
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
+	case "opencode":
+		models = s.resolveOpenCodeGoModels(a)
+		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -1672,6 +1676,53 @@ func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "google", "vertex")
+}
+
+func (s *Service) resolveOpenCodeGoModels(a *coreauth.Auth) []*ModelInfo {
+	apiKey := ""
+	if a.Attributes != nil {
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+	}
+	if apiKey == "" && a.Metadata != nil {
+		if v, ok := a.Metadata["key"].(string); ok {
+			apiKey = strings.TrimSpace(v)
+		}
+	}
+	if apiKey == "" {
+		return nil
+	}
+	client := opencode.NewClient(s.cfg)
+	entries, err := opencode.FetchModels(client, apiKey)
+	if err != nil {
+		log.Warnf("opencode: failed to fetch models for auth %q: %v", a.ID, err)
+		return nil
+	}
+	now := time.Now().Unix()
+	out := make([]*ModelInfo, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if e.ID == "" {
+			continue
+		}
+		id := strings.ToLower(strings.TrimSpace(e.ID))
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		displayName := strings.TrimSpace(e.ID)
+		thinking := &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+		out = append(out, &ModelInfo{
+			ID:          id,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     "opencode",
+			Type:        "opencode",
+			DisplayName: displayName,
+			UserDefined: false,
+			Thinking:    thinking,
+		})
+	}
+	return out
 }
 
 func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {

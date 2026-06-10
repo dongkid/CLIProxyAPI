@@ -2728,17 +2728,17 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 		}
 	}
 
-	fileName, err := opencode.CredentialFileName(h.cfg.AuthDir, keyName)
+		wspID := req.WorkspaceID
+		if wspID == "" {
+		wspID = "direct"
+	}
+
+		fileName, err := opencode.CredentialFileName(h.cfg.AuthDir, keyName, wspShort(wspID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename: " + err.Error()})
 		return
 	}
 
-	now := time.Now().UTC()
-	wspID := req.WorkspaceID
-	if wspID == "" {
-		wspID = "direct"
-	}
 	cookieToSave := ""
 	if req.Cookie != "" {
 		cookieToSave = strings.TrimSpace(req.Cookie)
@@ -2746,6 +2746,7 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 			cookieToSave = "auth=" + cookieToSave
 		}
 	}
+	now := time.Now().UTC()
 	record := &coreauth.Auth{
 		ID:        fileName,
 		Provider:  "opencode",
@@ -2762,6 +2763,8 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		Attributes: map[string]string{
+			"api_key":     targetKey.Key,
+			"base_url":    "https://opencode.ai/zen/go/v1",
 			"key_display": targetKey.Display,
 			"workspace":   wspID,
 		},
@@ -3192,4 +3195,17 @@ func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 		Headers: c.Request.Header,
 	}
 	return coreauth.WithRequestInfo(ctx, info)
+}
+
+// wspShort returns a short workspace identifier for use in filenames.
+// "wrk_01KTPQSGHX9JCE2Z04QJWYZ7ZH" → "wrk01" (keep prefix + first 5 meaningful chars).
+func wspShort(wspID string) string {
+	if wspID == "" || wspID == "direct" {
+		return ""
+	}
+	id := strings.TrimPrefix(wspID, "wrk_")
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	return "wrk" + id
 }
