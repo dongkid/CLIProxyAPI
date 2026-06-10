@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,10 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
+
+// shardCount governs the number of shards for distributed locking.
+// 16 is chosen as a power of two that balances concurrency against memory overhead.
+const shardCount = 16
 
 var statisticsEnabled atomic.Bool
 
@@ -61,20 +66,25 @@ func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
 func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 
 // RequestStatistics maintains aggregated request metrics in memory.
+// Global counters use atomic.Int64 to avoid lock contention.
+// Per-API data is distributed across 16 shards, each with its own mutex,
+// so that concurrent requests targeting different API keys can proceed in parallel.
 type RequestStatistics struct {
-	mu sync.RWMutex
+	totalRequests atomic.Int64
+	successCount  atomic.Int64
+	failureCount  atomic.Int64
+	totalTokens   atomic.Int64
+	shards        [shardCount]*statsShard
+}
 
-	totalRequests int64
-	successCount  int64
-	failureCount  int64
-	totalTokens   int64
-
-	apis map[string]*apiStats
-
+// statsShard holds a partition of the per-API statistics.
+type statsShard struct {
+	mu             sync.Mutex
+	apis           map[string]*apiStats
 	requestsByDay  map[string]int64
-	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
-	tokensByHour   map[int]int64
+	requestsByHour [24]int64
+	tokensByHour   [24]int64
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -88,20 +98,21 @@ type apiStats struct {
 type modelStats struct {
 	TotalRequests int64
 	TotalTokens   int64
-	Details       []RequestDetail
+	Details       *RingBuffer[RequestDetail]
 }
 
 // MaxDetailsPerModel limits the number of stored request details per model
-// to prevent unbounded memory growth. Once exceeded, the oldest entries are trimmed.
-// Set via SetMaxDetailsPerModel; defaults to 2000.
+// to prevent unbounded memory growth. Once exceeded, the oldest entries are
+// overwritten by the ring buffer. Set via SetMaxDetailsPerModel; defaults to 2000.
 var MaxDetailsPerModel = 2000
 
 // SetMaxDetailsPerModel updates the global detail retention limit. A value <= 0
-// leaves the current value unchanged.
+// resets to the default of 2000.
 func SetMaxDetailsPerModel(n int) {
-	if n > 0 {
-		MaxDetailsPerModel = n
+	if n <= 0 {
+		n = 2000
 	}
+	MaxDetailsPerModel = n
 }
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
@@ -110,21 +121,37 @@ type RequestDetail struct {
 	LatencyMs int64      `json:"latency_ms"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
+	Model     string     `json:"model"`
+	Alias     string     `json:"alias,omitempty"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
+	Fail      FailDetail `json:"fail,omitempty"`
+}
+
+// FailDetail captures HTTP failure metadata for a failed upstream attempt.
+type FailDetail struct {
+	StatusCode int    `json:"status_code,omitempty"`
+	Body       string `json:"body,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
 type TokenStats struct {
-	InputTokens     int64 `json:"input_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
-	CachedTokens    int64 `json:"cached_tokens"`
-	TotalTokens     int64 `json:"total_tokens"`
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	CachedTokens        int64 `json:"cached_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens,omitempty"`
+	TotalTokens         int64 `json:"total_tokens"`
 }
+
+// statsVersion is embedded in saved snapshots for forward compatibility.
+const statsVersion = 1
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
 type StatisticsSnapshot struct {
+	Version int `json:"version"`
+
 	TotalRequests int64 `json:"total_requests"`
 	SuccessCount  int64 `json:"success_count"`
 	FailureCount  int64 `json:"failure_count"`
@@ -159,13 +186,25 @@ func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics
 
 // NewRequestStatistics constructs an empty statistics store.
 func NewRequestStatistics() *RequestStatistics {
-	return &RequestStatistics{
-		apis:           make(map[string]*apiStats),
-		requestsByDay:  make(map[string]int64),
-		requestsByHour: make(map[int]int64),
-		tokensByDay:    make(map[string]int64),
-		tokensByHour:   make(map[int]int64),
+	s := &RequestStatistics{}
+	for i := range s.shards {
+		s.shards[i] = &statsShard{
+			apis:          make(map[string]*apiStats),
+			requestsByDay: make(map[string]int64),
+			tokensByDay:   make(map[string]int64),
+		}
 	}
+	return s
+}
+
+// shardIndex returns the shard for a given API key. Uses FNV-1a hashing.
+func shardIndex(key string) int {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h % shardCount)
 }
 
 // Record ingests a new usage record and updates the aggregates.
@@ -190,43 +229,56 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
-	success := !failed
 	modelName := record.Model
 	if modelName == "" {
 		modelName = "unknown"
 	}
+	alias := record.Alias
+	if alias == "" {
+		alias = record.Model
+	}
+	failInfo := FailDetail{}
+	if record.Fail.StatusCode != 0 || record.Fail.Body != "" {
+		failInfo = FailDetail{
+			StatusCode: record.Fail.StatusCode,
+			Body:       record.Fail.Body,
+		}
+	}
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.totalRequests++
-	if success {
-		s.successCount++
+	s.totalRequests.Add(1)
+	if !failed {
+		s.successCount.Add(1)
 	} else {
-		s.failureCount++
+		s.failureCount.Add(1)
 	}
-	s.totalTokens += totalTokens
+	s.totalTokens.Add(totalTokens)
 
-	stats, ok := s.apis[statsKey]
+	sh := s.shards[shardIndex(statsKey)]
+	sh.mu.Lock()
+	sh.requestsByDay[dayKey]++
+	sh.requestsByHour[hourKey]++
+	sh.tokensByDay[dayKey] += totalTokens
+	sh.tokensByHour[hourKey] += totalTokens
+
+	stats, ok := sh.apis[statsKey]
 	if !ok {
 		stats = &apiStats{Models: make(map[string]*modelStats)}
-		s.apis[statsKey] = stats
+		sh.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
+		Model:     modelName,
+		Alias:     alias,
 		Tokens:    detail,
 		Failed:    failed,
+		Fail:      failInfo,
 	})
-
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
+	sh.mu.Unlock()
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -234,72 +286,73 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	stats.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue, ok := stats.Models[model]
 	if !ok {
-		modelStatsValue = &modelStats{}
+		modelStatsValue = &modelStats{Details: NewRingBuffer[RequestDetail](MaxDetailsPerModel)}
 		stats.Models[model] = modelStatsValue
 	}
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
-	modelStatsValue.Details = append(modelStatsValue.Details, detail)
-	if len(modelStatsValue.Details) > MaxDetailsPerModel {
-		excess := len(modelStatsValue.Details) - MaxDetailsPerModel
-		modelStatsValue.Details = modelStatsValue.Details[excess:]
-	}
+	modelStatsValue.Details.Push(detail)
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
+//
+// The snapshot iterates shards sequentially without a global lock.
+// This means the returned data is a "fuzzy" point-in-time: each shard reflects
+// a slightly different instant. For usage statistics this is an acceptable
+// tradeoff — global totals (via atomic counters) remain internally consistent
+// and the sub-millisecond discrepancy between shards has no practical impact.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
-	result := StatisticsSnapshot{}
+	result := StatisticsSnapshot{Version: statsVersion}
 	if s == nil {
 		return result
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	result.TotalRequests = s.totalRequests.Load()
+	result.SuccessCount = s.successCount.Load()
+	result.FailureCount = s.failureCount.Load()
+	result.TotalTokens = s.totalTokens.Load()
 
-	result.TotalRequests = s.totalRequests
-	result.SuccessCount = s.successCount
-	result.FailureCount = s.failureCount
-	result.TotalTokens = s.totalTokens
+	result.APIs = make(map[string]APISnapshot)
+	result.RequestsByDay = make(map[string]int64)
+	result.RequestsByHour = make(map[string]int64)
+	result.TokensByDay = make(map[string]int64)
+	result.TokensByHour = make(map[string]int64)
 
-	result.APIs = make(map[string]APISnapshot, len(s.apis))
-	for apiName, stats := range s.apis {
-		apiSnapshot := APISnapshot{
-			TotalRequests: stats.TotalRequests,
-			TotalTokens:   stats.TotalTokens,
-			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
-		}
-		for modelName, modelStatsValue := range stats.Models {
-			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
-			copy(requestDetails, modelStatsValue.Details)
-			apiSnapshot.Models[modelName] = ModelSnapshot{
-				TotalRequests: modelStatsValue.TotalRequests,
-				TotalTokens:   modelStatsValue.TotalTokens,
-				Details:       requestDetails,
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		for apiName, stats := range sh.apis {
+			apiSnapshot, exists := result.APIs[apiName]
+			if !exists {
+				apiSnapshot = APISnapshot{Models: make(map[string]ModelSnapshot)}
 			}
+			apiSnapshot.TotalRequests += stats.TotalRequests
+			apiSnapshot.TotalTokens += stats.TotalTokens
+			for modelName, ms := range stats.Models {
+				existingModel, hasModel := apiSnapshot.Models[modelName]
+				if !hasModel {
+					existingModel = ModelSnapshot{}
+				}
+				snap := ms.Details.Snapshot()
+				existingModel.TotalRequests += ms.TotalRequests
+				existingModel.TotalTokens += ms.TotalTokens
+				existingModel.Details = append(existingModel.Details, snap...)
+				apiSnapshot.Models[modelName] = existingModel
+			}
+			result.APIs[apiName] = apiSnapshot
 		}
-		result.APIs[apiName] = apiSnapshot
-	}
-
-	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
-	for k, v := range s.requestsByDay {
-		result.RequestsByDay[k] = v
-	}
-
-	result.RequestsByHour = make(map[string]int64, len(s.requestsByHour))
-	for hour, v := range s.requestsByHour {
-		key := formatHour(hour)
-		result.RequestsByHour[key] = v
-	}
-
-	result.TokensByDay = make(map[string]int64, len(s.tokensByDay))
-	for k, v := range s.tokensByDay {
-		result.TokensByDay[k] = v
-	}
-
-	result.TokensByHour = make(map[string]int64, len(s.tokensByHour))
-	for hour, v := range s.tokensByHour {
-		key := formatHour(hour)
-		result.TokensByHour[key] = v
+		for k, v := range sh.requestsByDay {
+			result.RequestsByDay[k] += v
+		}
+		for hour, v := range sh.requestsByHour {
+			result.RequestsByHour[formatHour(hour)] += v
+		}
+		for k, v := range sh.tokensByDay {
+			result.TokensByDay[k] += v
+		}
+		for hour, v := range sh.tokensByHour {
+			result.TokensByHour[formatHour(hour)] += v
+		}
+		sh.mu.Unlock()
 	}
 
 	return result
@@ -312,39 +365,47 @@ type MergeResult struct {
 
 // MergeSnapshot merges an exported statistics snapshot into the current store.
 // Existing data is preserved and duplicate request details are skipped.
+// It uses a two-phase approach:
+// Phase 1 — scan all shards to build a cross-shard dedup set.
+// Phase 2 — for each entry in the snapshot, hash-route to the correct shard and merge.
 func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResult {
 	result := MergeResult{}
 	if s == nil {
 		return result
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// Phase 1: collect dedup keys from ALL shards.
 	seen := make(map[string]struct{})
-	for apiName, stats := range s.apis {
-		if stats == nil {
-			continue
-		}
-		for modelName, modelStatsValue := range stats.Models {
-			if modelStatsValue == nil {
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		for apiName, stats := range sh.apis {
+			if stats == nil {
 				continue
 			}
-			for _, detail := range modelStatsValue.Details {
-				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+			for modelName, ms := range stats.Models {
+				if ms == nil {
+					continue
+				}
+				for _, detail := range ms.Details.Snapshot() {
+					seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+				}
 			}
 		}
+		sh.mu.Unlock()
 	}
 
+	// Phase 2: merge each entry into its target shard.
 	for apiName, apiSnapshot := range snapshot.APIs {
 		apiName = strings.TrimSpace(apiName)
 		if apiName == "" {
 			continue
 		}
-		stats, ok := s.apis[apiName]
+		sh := s.shards[shardIndex(apiName)]
+		sh.mu.Lock()
+		stats, ok := sh.apis[apiName]
 		if !ok || stats == nil {
 			stats = &apiStats{Models: make(map[string]*modelStats)}
-			s.apis[apiName] = stats
+			sh.apis[apiName] = stats
 		} else if stats.Models == nil {
 			stats.Models = make(map[string]*modelStats)
 		}
@@ -367,57 +428,76 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 					continue
 				}
 				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
+				s.recordImportedLocked(apiName, modelName, stats, detail, sh)
 				result.Added++
 			}
 		}
+		sh.mu.Unlock()
 	}
 
 	return result
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
+// recordImportedLocked inserts an imported detail. Caller must hold sh.mu.
+func (s *RequestStatistics) recordImportedLocked(apiName, modelName string, stats *apiStats, detail RequestDetail, sh *statsShard) {
 	totalTokens := detail.Tokens.TotalTokens
 	if totalTokens < 0 {
 		totalTokens = 0
 	}
 
-	s.totalRequests++
+	s.totalRequests.Add(1)
 	if detail.Failed {
-		s.failureCount++
+		s.failureCount.Add(1)
 	} else {
-		s.successCount++
+		s.successCount.Add(1)
 	}
-	s.totalTokens += totalTokens
+	s.totalTokens.Add(totalTokens)
 
 	s.updateAPIStats(stats, modelName, detail)
 
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
 
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
+	sh.requestsByDay[dayKey]++
+	sh.requestsByHour[hourKey]++
+	sh.tokensByDay[dayKey] += totalTokens
+	sh.tokensByHour[hourKey] += totalTokens
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
-	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
-		apiName,
-		modelName,
-		timestamp,
-		detail.Source,
-		detail.AuthIndex,
-		detail.Failed,
-		tokens.InputTokens,
-		tokens.OutputTokens,
-		tokens.ReasoningTokens,
-		tokens.CachedTokens,
-		tokens.TotalTokens,
-	)
+
+	// Pre-size: apiName + modelName + timestamp + source + authIndex + 1(failed) + 5*20(tokens) + 11 separators
+	est := len(apiName) + len(modelName) + len(timestamp) + len(detail.Source) + len(detail.AuthIndex) + 120
+	var b strings.Builder
+	b.Grow(est)
+	b.WriteString(apiName)
+	b.WriteByte('|')
+	b.WriteString(modelName)
+	b.WriteByte('|')
+	b.WriteString(timestamp)
+	b.WriteByte('|')
+	b.WriteString(detail.Source)
+	b.WriteByte('|')
+	b.WriteString(detail.AuthIndex)
+	b.WriteByte('|')
+	if detail.Failed {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(tokens.InputTokens, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(tokens.OutputTokens, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(tokens.ReasoningTokens, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(tokens.CachedTokens, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(tokens.TotalTokens, 10))
+	return b.String()
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
@@ -444,14 +524,13 @@ const httpStatusBadRequest = 400
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
 	tokens := TokenStats{
-		InputTokens:     detail.InputTokens,
-		OutputTokens:    detail.OutputTokens,
-		ReasoningTokens: detail.ReasoningTokens,
-		CachedTokens:    detail.CachedTokens,
-		TotalTokens:     detail.TotalTokens,
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+		InputTokens:         detail.InputTokens,
+		OutputTokens:        detail.OutputTokens,
+		ReasoningTokens:     detail.ReasoningTokens,
+		CachedTokens:        detail.CachedTokens,
+		CacheReadTokens:     detail.CacheReadTokens,
+		CacheCreationTokens: detail.CacheCreationTokens,
+		TotalTokens:         detail.TotalTokens,
 	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CachedTokens
@@ -461,10 +540,10 @@ func normaliseDetail(detail coreusage.Detail) TokenStats {
 
 func normaliseTokenStats(tokens TokenStats) TokenStats {
 	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
+	}
+	if tokens.CacheReadTokens == 0 {
+		tokens.CacheReadTokens = tokens.CachedTokens
 	}
 	return tokens
 }
@@ -558,11 +637,12 @@ func DefaultStatsSavePath(authDir string) string {
 var AutoSaveInterval = 5 * time.Minute
 
 // SetAutoSaveInterval updates the global auto-save interval. An interval <= 0
-// leaves the current value unchanged.
+// resets to the default of 5 minutes.
 func SetAutoSaveInterval(d time.Duration) {
-	if d > 0 {
-		AutoSaveInterval = d
+	if d <= 0 {
+		d = 5 * time.Minute
 	}
+	AutoSaveInterval = d
 }
 
 // StartAutoSave launches a background goroutine that periodically persists the
