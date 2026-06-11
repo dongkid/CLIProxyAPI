@@ -29,7 +29,6 @@ func (h *Handler) ExportUsage(c *gin.Context) {
 }
 
 // ImportUsage merges an uploaded usage statistics snapshot into the current store.
-// ImportUsage merges an uploaded usage statistics snapshot into the current store.
 // Limits request body to 50 MB to prevent memory exhaustion.
 func (h *Handler) ImportUsage(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 50<<20)

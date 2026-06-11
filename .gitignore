@@ -56,3 +56,7 @@ _bmad-output/*
 data/*
 
 .gocache/
+link-management.ps1
+management.html
+temp*
+test*
