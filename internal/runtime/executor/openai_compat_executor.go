@@ -171,6 +171,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
+	translated = helps.DeduplicateSystemMessages(translated)     // [cpa-dedup] remove duplicate consecutive system messages to improve upstream cache hit rate
+	translated = helps.AppendEphemeralSystemMessages(translated) // [cpa-eph] move PreToolUse hooks to end for stable cache prefix
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -399,6 +401,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
+	translated = helps.DeduplicateSystemMessages(translated)     // [cpa-dedup] remove duplicate consecutive system messages to improve upstream cache hit rate
+	translated = helps.AppendEphemeralSystemMessages(translated) // [cpa-eph] move PreToolUse hooks to end for stable cache prefix
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
