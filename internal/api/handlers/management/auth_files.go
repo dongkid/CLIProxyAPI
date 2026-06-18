@@ -2728,12 +2728,12 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 		}
 	}
 
-		wspID := req.WorkspaceID
-		if wspID == "" {
+	wspID := req.WorkspaceID
+	if wspID == "" {
 		wspID = "direct"
 	}
 
-		fileName, err := opencode.CredentialFileName(h.cfg.AuthDir, keyName, wspShort(wspID))
+	fileName, err := opencode.CredentialFileName(h.cfg.AuthDir, keyName, wspShort(wspID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename: " + err.Error()})
 		return
@@ -2748,11 +2748,11 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 	}
 	now := time.Now().UTC()
 	record := &coreauth.Auth{
-		ID:        fileName,
-		Provider:  "opencode",
-		FileName:  fileName,
-		Label:     keyName,
-		Status:    coreauth.StatusActive,
+		ID:       fileName,
+		Provider: "opencode",
+		FileName: fileName,
+		Label:    keyName,
+		Status:   coreauth.StatusActive,
 		Storage: &opencode.TokenStorage{
 			Type:      "opencode",
 			Label:     keyName,
@@ -2760,8 +2760,8 @@ func (h *Handler) SaveOpenCodeToken(c *gin.Context) {
 			Workspace: wspID,
 			Cookie:    cookieToSave,
 		},
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		CreatedAt: now,
+		UpdatedAt: now,
 		Attributes: map[string]string{
 			"api_key":     targetKey.Key,
 			"base_url":    "https://opencode.ai/zen/go/v1",

@@ -336,3 +336,648 @@ func TestEph_Phase1ThenEph(t *testing.T) {
 		t.Fatalf("expected Read then Edit at end, got [%s, %s]", lastTwo, lastOne)
 	}
 }
+
+// --- NormalizePreToolUseMessages tests ---
+
+func TestNorm_NoMessages(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4-flash"}`)
+	out := NormalizePreToolUseMessages(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestNorm_NoUserPTU(t *testing.T) {
+	// User string content → normalized to array format for byte-stability
+	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
+	}
+	// User msg content normalized to array
+	c0 := gjson.GetBytes(out, "messages.0.content")
+	if !c0.IsArray() || c0.Get("0.text").String() != "hello" {
+		t.Fatalf("expected user content as array, got %s", c0.Raw)
+	}
+}
+
+func TestNorm_SingleUserPTUExtracted(t *testing.T) {
+	// Single user-role message with <system-reminder> wrapped PTU
+	ptuText := `<system-reminder>
+PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
+</system-reminder>`
+	body := []byte(`{"messages":[{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},{"role":"assistant","content":"done"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// Original 3 messages, user PTU deleted (-1), system PTU inserted at same position (+1) → 3
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// PTU should be at position 1 (replacing the deleted user message)
+	ptu := gjson.GetBytes(out, "messages.1")
+	if ptu.Get("role").String() != "system" {
+		t.Fatalf("expected messages.1 role=system, got %s", ptu.Get("role").String())
+	}
+	if !strings.Contains(ptu.Get("content").String(), "PreToolUse:Read hook") {
+		t.Fatalf("expected messages.1 to contain PreToolUse:Read hook, got %s", ptu.Get("content").String())
+	}
+	// Content should NOT have <system-reminder> wrapper
+	if strings.Contains(ptu.Get("content").String(), "<system-reminder>") {
+		t.Fatalf("extracted PTU should not contain <system-reminder> wrapper")
+	}
+	// Assistant messages preserved at original positions
+	if gjson.GetBytes(out, "messages.0.content").String() != "ok" {
+		t.Fatalf("expected messages.0 to be 'ok', got %s", gjson.GetBytes(out, "messages.0.content").String())
+	}
+	if gjson.GetBytes(out, "messages.2.content").String() != "done" {
+		t.Fatalf("expected messages.2 to be 'done', got %s", gjson.GetBytes(out, "messages.2.content").String())
+	}
+}
+
+func TestNorm_MultipleUserPTUDeduped(t *testing.T) {
+	// Two identical user PTU messages → extracted, deduped to one, inserted at first deletion position
+	ptuText := `<system-reminder>
+PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
+</system-reminder>`
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},{"role":"assistant","content":"mid"},{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},{"role":"assistant","content":"end"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// Original 4, 2 user PTU deleted (-2), 1 system PTU inserted at first deletion position (+1) → 3
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// System PTU at position 0 (first deleted user PTU, not at end)
+	ptu := gjson.GetBytes(out, "messages.0")
+	if ptu.Get("role").String() != "system" {
+		t.Fatalf("expected messages.0 role=system (PTU at first deletion), got %s", ptu.Get("role").String())
+	}
+	if !strings.Contains(ptu.Get("content").String(), "PreToolUse:") {
+		t.Fatalf("expected messages.0 to contain PreToolUse:, got %s", ptu.Get("content").String())
+	}
+	// Assistant messages preserved in order after PTU
+	mid := gjson.GetBytes(out, "messages.1")
+	if mid.Get("role").String() != "assistant" || mid.Get("content").String() != "mid" {
+		t.Fatalf("expected messages.1 to be assistant 'mid', got %s", mid.Get("content").String())
+	}
+	end := gjson.GetBytes(out, "messages.2")
+	if end.Get("role").String() != "assistant" || end.Get("content").String() != "end" {
+		t.Fatalf("expected messages.2 to be assistant 'end', got %s", end.Get("content").String())
+	}
+}
+
+func TestNorm_MultiElementExtractsPTU(t *testing.T) {
+	// Multi-element array: PTU + real content → system PTU at deletion pos, real content in user msg after
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"real content"},{"type":"text","text":"<system-reminder>\nPreToolUse:Read hook.\n</system-reminder>"}]},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// Original 2, user deleted → system PTU + user(real content) → 3 messages
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// First message: system PTU
+	if gjson.GetBytes(out, "messages.0.role").String() != "system" {
+		t.Fatalf("expected messages.0 to be system PTU, got %s", gjson.GetBytes(out, "messages.0.role").String())
+	}
+	if !strings.Contains(gjson.GetBytes(out, "messages.0.content").String(), "PreToolUse:Read hook.") {
+		t.Fatalf("expected messages.0 to contain PTU, got %s", gjson.GetBytes(out, "messages.0.content").String())
+	}
+	// Second message: user with real content
+	if gjson.GetBytes(out, "messages.1.role").String() != "user" {
+		t.Fatalf("expected messages.1 to be user, got %s", gjson.GetBytes(out, "messages.1.role").String())
+	}
+	if !strings.Contains(gjson.GetBytes(out, "messages.1.content.0.text").String(), "real content") {
+		t.Fatalf("expected messages.1 to contain real content, got %s", gjson.GetBytes(out, "messages.1.content.0.text").String())
+	}
+	// Third message: assistant
+	if gjson.GetBytes(out, "messages.2.content").String() != "ok" {
+		t.Fatalf("expected messages.2 to be 'ok', got %s", gjson.GetBytes(out, "messages.2.content").String())
+	}
+}
+
+func TestNorm_MultiElementAllPTUExtracted(t *testing.T) {
+	// All elements are PTU → all extracted as system messages
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nPreToolUse:Read hook A.\n</system-reminder>"},{"type":"text","text":"<system-reminder>\nPreToolUse:Read hook B.\n</system-reminder>"}]},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// Original 2, user deleted → 2 system PTU + assistant = 3
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// Messages 0 and 1 should both be system PTU
+	for i := 0; i < 2; i++ {
+		if gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String() != "system" {
+			t.Fatalf("expected messages.%d to be system PTU, got %s", i, gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String())
+		}
+	}
+	// Assistant preserved
+	if gjson.GetBytes(out, "messages.2.content").String() != "ok" {
+		t.Fatalf("expected messages.2 to be 'ok', got %s", gjson.GetBytes(out, "messages.2.content").String())
+	}
+}
+
+func TestNorm_MultiElementPreAndPostToolUse(t *testing.T) {
+	// Real-world PreToolUse + PostToolUse in one array → PTU extracted, PostToolUse stays as user
+	content := `[{"type":"text","text":"<system-reminder>\nPreToolUse:Edit hook additional context: Verify changes.\n</system-reminder>"},{"type":"text","text":"<system-reminder>\nPostToolUse:Edit hook additional context: Code modified.\n</system-reminder>"}]`
+	body := []byte(`{"messages":[{"role":"user","content":` + content + `},{"role":"assistant","content":"done"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// Original 2, user deleted → system PTU + user(PostToolUse) = 3
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// Message 0: system PTU
+	if gjson.GetBytes(out, "messages.0.role").String() != "system" {
+		t.Fatalf("expected messages.0 to be system PTU, got %s", gjson.GetBytes(out, "messages.0.role").String())
+	}
+	if !strings.Contains(gjson.GetBytes(out, "messages.0.content").String(), "PreToolUse:Edit hook") {
+		t.Fatalf("expected messages.0 to contain PTU, got %s", gjson.GetBytes(out, "messages.0.content").String())
+	}
+	// Message 1: user with PostToolUse preserved
+	if gjson.GetBytes(out, "messages.1.role").String() != "user" {
+		t.Fatalf("expected messages.1 to be user, got %s", gjson.GetBytes(out, "messages.1.role").String())
+	}
+	// Message 2: assistant
+	if gjson.GetBytes(out, "messages.2.role").String() != "assistant" || gjson.GetBytes(out, "messages.2.content").String() != "done" {
+		t.Fatalf("expected messages.2 to be assistant 'done', got %s", gjson.GetBytes(out, "messages.2.content").String())
+	}
+}
+
+func TestNorm_NoSystemReminderPrefix(t *testing.T) {
+	// User message contains PreToolUse but NOT wrapped in <system-reminder>
+	// → NOT extracted (safety: real user message could contain "PreToolUse" text)
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"I found PreToolUse:Read hook in the logs"}]},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change for non-system-reminder text, got %s", string(out))
+	}
+}
+
+func TestNorm_NonTextElementIgnored(t *testing.T) {
+	// User message with non-text element (e.g., image) → not processed
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change for non-text element, got %s", string(out))
+	}
+}
+
+func TestNorm_AlreadySystemPTUUnchanged(t *testing.T) {
+	// Existing system-role PTU → stays system. User string → array normalized.
+	body := []byte(`{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"PreToolUse:Read hook: read in parallel."},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	// User "hi" should be array now
+	c0 := gjson.GetBytes(out, "messages.0.content")
+	if !c0.IsArray() || c0.Get("0.text").String() != "hi" {
+		t.Fatalf("expected user content as array, got %s", c0.Raw)
+	}
+	// System PTU unchanged
+	if gjson.GetBytes(out, "messages.1.role").String() != "system" {
+		t.Fatalf("expected system PTU unchanged")
+	}
+}
+
+func TestNorm_StringContentPTUExtracted(t *testing.T) {
+	// Content is a string wrapped in <system-reminder> → extracted as system PTU
+	body := []byte(`{"messages":[{"role":"user","content":"<system-reminder>\nPreToolUse:Read hook.\n</system-reminder>"},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
+	}
+	// Message 0: system PTU
+	if gjson.GetBytes(out, "messages.0.role").String() != "system" {
+		t.Fatalf("expected messages.0 to be system PTU, got %s", gjson.GetBytes(out, "messages.0.role").String())
+	}
+	if !strings.Contains(gjson.GetBytes(out, "messages.0.content").String(), "PreToolUse:Read hook") {
+		t.Fatalf("expected messages.0 to contain PTU, got %s", gjson.GetBytes(out, "messages.0.content").String())
+	}
+	// No <system-reminder> wrapper
+	if strings.Contains(gjson.GetBytes(out, "messages.0.content").String(), "<system-reminder>") {
+		t.Fatalf("extracted PTU should not contain <system-reminder> wrapper")
+	}
+	// Message 1: assistant
+	if gjson.GetBytes(out, "messages.1.content").String() != "ok" {
+		t.Fatalf("expected messages.1 to be 'ok', got %s", gjson.GetBytes(out, "messages.1.content").String())
+	}
+}
+
+func TestNorm_RawStringPTUExtracted(t *testing.T) {
+	// CC Format B: raw string starting with "PreToolUse:" → extracted as system PTU
+	body := []byte(`{"messages":[{"role":"user","content":"PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.\n\nPostToolUse:Read hook additional context: Extensive reading."},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
+	}
+	// Message 0: system PTU
+	if gjson.GetBytes(out, "messages.0.role").String() != "system" {
+		t.Fatalf("expected messages.0 to be system PTU, got %s", gjson.GetBytes(out, "messages.0.role").String())
+	}
+	if !strings.Contains(gjson.GetBytes(out, "messages.0.content").String(), "PreToolUse:Read hook") {
+		t.Fatalf("expected messages.0 to contain PTU, got %s", gjson.GetBytes(out, "messages.0.content").String())
+	}
+	// Message 1: assistant
+	if gjson.GetBytes(out, "messages.1.content").String() != "ok" {
+		t.Fatalf("expected messages.1 to be 'ok', got %s", gjson.GetBytes(out, "messages.1.content").String())
+	}
+}
+
+func TestNorm_PlainStringContentNormalized(t *testing.T) {
+	// Plain user string that does NOT look like hook injection →
+	// content format normalized to array for byte-stability between rounds
+	body := []byte(`{"messages":[{"role":"user","content":"What is PreToolUse in this context?"},{"role":"assistant","content":"ok"}]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	c0 := gjson.GetBytes(out, "messages.0.content")
+	if !c0.IsArray() || !strings.Contains(c0.Get("0.text").String(), "PreToolUse") {
+		t.Fatalf("expected user content normalized to array, got %s", c0.Raw)
+	}
+}
+
+func TestNorm_RealWorldPattern(t *testing.T) {
+	// Simulates the actual e81 pattern: conversation with inline PTU user messages
+	ptuText := `<system-reminder>
+PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
+</system-reminder>`
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[
+		{"role":"system","content":[{"type":"text","text":"You are Claude."}]},
+		{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer..."}]},
+		{"role":"assistant","content":[{"type":"thinking","thinking":"..."}]},
+		{"role":"user","content":[{"type":"text","text":"normal user message"}]},
+		{"role":"tool","content":"tool output here"},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"assistant","content":"response after PTU"},
+		{"role":"tool","content":"more tool output"},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"assistant","content":"final response"}
+	]}`)
+	out := NormalizePreToolUseMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// original 10, 2 user PTU deleted (-2), 1 system PTU inserted at first deletion position (+1) → 9
+	if count != 9 {
+		t.Fatalf("expected 9 messages, got %d: %s", count, string(out))
+	}
+	// System PTU should be at position 5 (where the first user PTU was deleted),
+	// not at the end.
+	ptuRole := gjson.GetBytes(out, "messages.5.role").String()
+	if ptuRole != "system" {
+		t.Fatalf("expected messages.5 role=system (PTU at first deletion), got %s", ptuRole)
+	}
+	ptuContent := gjson.GetBytes(out, "messages.5.content").String()
+	if !strings.Contains(ptuContent, "PreToolUse:Read hook") {
+		t.Fatalf("expected messages.5 to contain PreToolUse:, got %s", ptuContent)
+	}
+	// The assistant "response after PTU" stays at position 6 (unchanged)
+	asstContent := gjson.GetBytes(out, "messages.6.content").String()
+	if !strings.Contains(asstContent, "response after PTU") {
+		t.Fatalf("expected messages.6 to be 'response after PTU', got %s", asstContent)
+	}
+	// "final response" should be at position 8 (was 9, shifted by 1 due to second PTU deletion)
+	finalContent := gjson.GetBytes(out, "messages.8.content").String()
+	if !strings.Contains(finalContent, "final response") {
+		t.Fatalf("expected messages.8 to be 'final response', got %s", finalContent)
+	}
+}
+
+func TestNorm_StripSystemReminder(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{
+			input:    "<system-reminder>\nPreToolUse:Read.\n</system-reminder>",
+			expected: "PreToolUse:Read.",
+		},
+		{
+			input:    "<system-reminder>\nPreToolUse:Read hook: read in parallel.\n</system-reminder>",
+			expected: "PreToolUse:Read hook: read in parallel.",
+		},
+		{
+			input:    "<system-reminder>PreToolUse:Inline.</system-reminder>",
+			expected: "PreToolUse:Inline.",
+		},
+		{
+			input:    "<system-reminder>PreToolUse:Read hook.\n\nMulti line.\n</system-reminder>",
+			expected: "PreToolUse:Read hook.\n\nMulti line.",
+		},
+	}
+	for _, tt := range tests {
+		got := stripSystemReminder(tt.input)
+		if got != tt.expected {
+			t.Fatalf("stripSystemReminder(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestNorm_IsSystemInjectedPTU(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{input: "<system-reminder>\nPreToolUse:Read.\n</system-reminder>", expected: true},
+		{input: "normal text PreToolUse:Read.", expected: false},
+		{input: "<system-reminder>\nPreToolUse:Read.", expected: false},                                // missing close tag
+		{input: "PreToolUse:Read.\n</system-reminder>", expected: false},                               // missing open tag
+		{input: "<system-reminder>\nSomeOtherTag:Read.\n</system-reminder>", expected: false},          // no PreToolUse
+		{input: "I found <system-reminder>PreToolUse:Read</system-reminder> in logs", expected: false}, // extra text after close tag
+	}
+	for _, tt := range tests {
+		got := isSystemInjectedPTU(tt.input)
+		if got != tt.expected {
+			t.Fatalf("isSystemInjectedPTU(%q) = %v, want %v", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestNorm_FullPipelineWithDedup(t *testing.T) {
+	// Full pipeline: normalise → dedup (no eph)
+	ptuText := `<system-reminder>
+PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
+</system-reminder>`
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"assistant","content":"mid"},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"assistant","content":"end"}
+	]}`)
+	out := NormalizePreToolUseMessages(body)
+	out = DeduplicateSystemMessages(out)
+
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// original 5, 2 user PTU deleted (-2), 1 system PTU inserted at first deletion position (+1) → 4
+	if count != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	}
+	// System PTU inserted at position of first deleted user PTU (index 1)
+	// Expected order: [0] sys(identity), [1] sys(PTU), [2] asst("mid"), [3] asst("end")
+	msg1Role := gjson.GetBytes(out, "messages.1.role").String()
+	if msg1Role != "system" {
+		t.Fatalf("expected messages.1 role=system (PTU inserted at first deletion), got %s", msg1Role)
+	}
+	msg1Content := gjson.GetBytes(out, "messages.1.content").String()
+	if !strings.Contains(msg1Content, "PreToolUse:Read hook") {
+		t.Fatalf("expected messages.1 to contain PreToolUse:, got %s", msg1Content)
+	}
+	// Assistant messages preserved in order
+	firstRole := gjson.GetBytes(out, "messages.0.role").String()
+	if firstRole != "system" || !strings.Contains(gjson.GetBytes(out, "messages.0.content").String(), "Claude") {
+		t.Fatalf("expected messages.0 to be system identity, got role=%s", firstRole)
+	}
+	midContent := gjson.GetBytes(out, "messages.2.content").String()
+	if midContent != "mid" {
+		t.Fatalf("expected messages.2 to be 'mid', got %s", midContent)
+	}
+	endContent := gjson.GetBytes(out, "messages.3.content").String()
+	if endContent != "end" {
+		t.Fatalf("expected messages.3 to be 'end', got %s", endContent)
+	}
+}
+
+// --- RelocateHookMessages tests ---
+
+func TestReloc_NoHooks(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}`)
+	out := RelocateHookMessages(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestReloc_PTURelocatedToEnd(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"system","content":"PreToolUse:Read hook additional context: Read files in parallel."},{"role":"assistant","content":"done"}]}`)
+	out := RelocateHookMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// 3 original, PTU moved (not deleted) → 3 still
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// PTU should be at the end
+	lastRole := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", count-1)).String()
+	if lastRole != "system" {
+		t.Fatalf("expected last message role=system (PTU), got %s", lastRole)
+	}
+	lastContent := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", count-1)).String()
+	if !strings.Contains(lastContent, "PreToolUse:Read hook") {
+		t.Fatalf("expected last message to contain PTU, got %s", lastContent)
+	}
+	// User message still at position 0
+	if gjson.GetBytes(out, "messages.0.content").String() != "hello" {
+		t.Fatalf("expected hello at position 0")
+	}
+	// Assistant at position 1
+	if gjson.GetBytes(out, "messages.1.content").String() != "done" {
+		t.Fatalf("expected done at position 1")
+	}
+}
+
+func TestReloc_PostToolUseRemoved(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"user","content":"PostToolUse:Read hook additional context: Read 5 files."},{"role":"assistant","content":"done"}]}`)
+	out := RelocateHookMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// 3 original, PostToolUse removed → 2
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
+	}
+	if gjson.GetBytes(out, "messages.0.content").String() != "hello" {
+		t.Fatalf("expected hello at position 0")
+	}
+	if gjson.GetBytes(out, "messages.1.content").String() != "done" {
+		t.Fatalf("expected done at position 1")
+	}
+}
+
+func TestReloc_MultiplePTUDedupedAtEnd(t *testing.T) {
+	// Two identical PTU messages → deduplicated to one at end
+	body := []byte(`{"messages":[{"role":"system","content":"PreToolUse:Read hook: read in parallel."},{"role":"user","content":"real query"},{"role":"system","content":"PreToolUse:Read hook: read in parallel."},{"role":"assistant","content":"ok"}]}`)
+	out := RelocateHookMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// 4 original, 2 PTU removed, 1 unique PTU appended → 3
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+	// user "real query" at position 0
+	if gjson.GetBytes(out, "messages.0.content").String() != "real query" {
+		t.Fatalf("expected real query at position 0, got %s", gjson.GetBytes(out, "messages.0.content").String())
+	}
+	// assistant at position 1
+	if gjson.GetBytes(out, "messages.1.content").String() != "ok" {
+		t.Fatalf("expected ok at position 1")
+	}
+	// PTU at the end (position 2)
+	lastRole := gjson.GetBytes(out, "messages.2.role").String()
+	if lastRole != "system" {
+		t.Fatalf("expected last message role=system, got %s", lastRole)
+	}
+}
+
+func TestReloc_MixedPTUAndPostToolUse(t *testing.T) {
+	// Mix of PTU, PostToolUse, and real conversation
+	body := []byte(`{"messages":[{"role":"user","content":"query"},{"role":"system","content":"PreToolUse:Read hook: parallel reads."},{"role":"user","content":"PostToolUse:Read hook: read 10 files."},{"role":"assistant","content":"response"},{"role":"system","content":"PreToolUse:Edit hook: verify changes."}]}`)
+	out := RelocateHookMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// 5 original, 2 PTU removed, 1 PostToolUse removed → 2 (query + assistant) + 2 PTU at end = 4
+	if count != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	}
+	// Position 0: user query
+	if gjson.GetBytes(out, "messages.0.role").String() != "user" {
+		t.Fatalf("expected user at position 0, got %s", gjson.GetBytes(out, "messages.0.role").String())
+	}
+	// Position 1: assistant
+	if gjson.GetBytes(out, "messages.1.role").String() != "assistant" {
+		t.Fatalf("expected assistant at position 1")
+	}
+	// Position 2,3: system PTU
+	if gjson.GetBytes(out, "messages.2.role").String() != "system" {
+		t.Fatalf("expected system PTU at position 2")
+	}
+	if gjson.GetBytes(out, "messages.3.role").String() != "system" {
+		t.Fatalf("expected system PTU at position 3")
+	}
+}
+
+func TestReloc_NoMessages(t *testing.T) {
+	body := []byte(`{"model":"test"}`)
+	out := RelocateHookMessages(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestReloc_FullPipeline(t *testing.T) {
+	// Full pipeline: normalize → dedup → relocate → canonical
+	ptuText := `<system-reminder>
+PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
+</system-reminder>`
+	postText := `<system-reminder>
+PostToolUse:Read hook additional context: Extensive reading (5 files).
+</system-reminder>`
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"assistant","content":"mid"},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"user","content":[{"type":"text","text":"` + postText + `"}]},
+		{"role":"assistant","content":"end"}
+	]}`)
+	out := NormalizePreToolUseMessages(body)
+	out = DeduplicateSystemMessages(out)
+	out = RelocateHookMessages(out)
+	out = CanonicalizeJSON(out)
+
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	// Original 6: sys, user(PTU), asst, user(PTU dup), user(PostToolUse), asst
+	// After normalize: sys, sys(PTU@1), asst(mid), sys(PTU@3 deduped?), user(PostToolUse@4), asst(end)
+	// Actually: user[0]→sys PTU, user[3](duplicate PTU)→deleted(dedup by norm), user[4](PostToolUse) stays
+	// After normalize: sys, sys(PTU), asst(mid), user(PostToolUse), asst(end) = 5
+	// After dedup: same (no duplicate sys)
+	// After relocate: sys, asst(mid), asst(end), sys(PTU@end) = 4
+	// We don't assert exact count, just that PTU is at end and PostToolUse is gone
+	messages := gjson.GetBytes(out, "messages")
+	lastIdx := int(messages.Get("#").Int()) - 1
+	if messages.Get(fmt.Sprintf("%d.role", lastIdx)).String() != "system" {
+		t.Fatalf("expected PTU at end, got role=%s at last position", messages.Get(fmt.Sprintf("%d.role", lastIdx)).String())
+	}
+	// Verify no PostToolUse anywhere
+	outStr := string(out)
+	if strings.Contains(outStr, "PostToolUse:") {
+		t.Fatalf("PostToolUse should be removed: %s", outStr)
+	}
+	// Verify PTU content preserved
+	if !strings.Contains(outStr, "PreToolUse:Read hook") {
+		t.Fatalf("PTU content missing")
+	}
+}
+
+func TestReloc_RoundBoundarySimulation(t *testing.T) {
+	// Simulate cross-round: prev round has PTU+PostToolUse, new round has different hooks
+	// Both should produce the same conversation prefix
+	ptuA := "PreToolUse:Read hook: read in parallel."
+	ptuB := "PreToolUse:Edit hook: verify changes."
+	postA := "PostToolUse:Read hook: read 10 files."
+
+	prevBody := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"real query"},
+		{"role":"assistant","content":"response"},
+		{"role":"tool","content":"result"},
+		{"role":"system","content":"` + ptuA + `"},
+		{"role":"user","content":"` + postA + `"}
+	]}`)
+
+	nextBody := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"real query"},
+		{"role":"assistant","content":"response"},
+		{"role":"tool","content":"result"},
+		{"role":"system","content":"` + ptuB + `"}
+	]}`)
+
+	outPrev := RelocateHookMessages(prevBody)
+	outNext := RelocateHookMessages(nextBody)
+
+	if !gjson.ValidBytes(outPrev) || !gjson.ValidBytes(outNext) {
+		t.Fatalf("output is not valid JSON")
+	}
+
+	// Both should have conversation prefix [sys, user, assistant, tool]
+	// as the first N messages, differing only in PTU at end
+	for i := 0; i < 4; i++ {
+		rPrev := gjson.GetBytes(outPrev, fmt.Sprintf("messages.%d.role", i)).String()
+		rNext := gjson.GetBytes(outNext, fmt.Sprintf("messages.%d.role", i)).String()
+		if rPrev != rNext {
+			t.Fatalf("position %d: expected %s == %s for cache prefix match", i, rPrev, rNext)
+		}
+	}
+}

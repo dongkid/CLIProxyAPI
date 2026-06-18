@@ -36,8 +36,8 @@ func TestApplyPayloadConfig_SupportsMultimodalTrue_NoFiltering(t *testing.T) {
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "test-model",
-					Protocol:          "openai",
+					Name:               "test-model",
+					Protocol:           "openai",
 					SupportsMultimodal: ptrBool(true),
 				}},
 				Params: map[string]any{"temperature": 0.5},
@@ -60,8 +60,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_OpenAI_StripsImages(t *testi
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "test-model",
-					Protocol:          "openai",
+					Name:               "test-model",
+					Protocol:           "openai",
 					SupportsMultimodal: &falseVal,
 				}},
 				Params: map[string]any{"temperature": 0.5},
@@ -91,8 +91,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_OpenAI_PreservesText(t *test
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "test-model",
-					Protocol:          "openai",
+					Name:               "test-model",
+					Protocol:           "openai",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -114,8 +114,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_OpenAI_PureText_Unchanged(t 
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "test-model",
-					Protocol:          "openai",
+					Name:               "test-model",
+					Protocol:           "openai",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -137,8 +137,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Claude_StripsImages(t *testi
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "claude-model",
-					Protocol:          "claude",
+					Name:               "claude-model",
+					Protocol:           "claude",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -163,8 +163,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Gemini_StripsInlineData(t *t
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "gemini-model",
-					Protocol:          "gemini",
+					Name:               "gemini-model",
+					Protocol:           "gemini",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -193,8 +193,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Codex_StripsInputImage(t *te
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "codex-model",
-					Protocol:          "codex",
+					Name:               "codex-model",
+					Protocol:           "codex",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -219,8 +219,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_WildcardMatch(t *testing.T) 
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "deepseek-*",
-					Protocol:          "openai",
+					Name:               "deepseek-*",
+					Protocol:           "openai",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -242,8 +242,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_WrongProtocol_NoFiltering(t 
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "test-model",
-					Protocol:          "openai",
+					Name:               "test-model",
+					Protocol:           "openai",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -265,8 +265,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Claude_ToolResultPreserved(t
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "claude-model",
-					Protocol:          "claude",
+					Name:               "claude-model",
+					Protocol:           "claude",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -291,8 +291,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Claude_ToolResultImageDetect
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "claude-model",
-					Protocol:          "claude",
+					Name:               "claude-model",
+					Protocol:           "claude",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -317,8 +317,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Claude_DocumentStripped(t *t
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "claude-model",
-					Protocol:          "claude",
+					Name:               "claude-model",
+					Protocol:           "claude",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -340,8 +340,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_Antigravity_StripsInlineData
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "ag-model",
-					Protocol:          "antigravity",
+					Name:               "ag-model",
+					Protocol:           "antigravity",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -367,8 +367,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_OpenAIResponse_StripsInputIm
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "my-model",
-					Protocol:          "openai-response",
+					Name:               "my-model",
+					Protocol:           "openai-response",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},
@@ -393,8 +393,8 @@ func TestApplyPayloadConfig_SupportsMultimodalFalse_OpenAI_InputAudioStripped(t 
 		Payload: config.PayloadConfig{
 			Default: []config.PayloadRule{{
 				Models: []config.PayloadModelRule{{
-					Name:              "audio-model",
-					Protocol:          "openai",
+					Name:               "audio-model",
+					Protocol:           "openai",
 					SupportsMultimodal: &falseVal,
 				}},
 			}},

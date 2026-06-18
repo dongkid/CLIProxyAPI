@@ -271,7 +271,6 @@ func IsAuthError(err error) bool {
 	return strings.Contains(err.Error(), "key invalid")
 }
 
-
 // NewClient creates a proxy-aware HTTP client for OpenCode API calls.
 // Uses util.SetProxy for full SOCKS5/HTTP/HTTPS proxy support (same as xAI/kimi auth packages).
 func NewClient(cfg *config.Config) *http.Client {
