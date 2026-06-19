@@ -787,18 +787,9 @@ func TestReloc_PTURelocatedToEnd(t *testing.T) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
 	count := gjson.GetBytes(out, "messages.#").Int()
-	// 3 original, PTU moved (not deleted) → 3 still
-	if count != 3 {
-		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
-	}
-	// PTU should be at the end
-	lastRole := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", count-1)).String()
-	if lastRole != "system" {
-		t.Fatalf("expected last message role=system (PTU), got %s", lastRole)
-	}
-	lastContent := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", count-1)).String()
-	if !strings.Contains(lastContent, "PreToolUse:Read hook") {
-		t.Fatalf("expected last message to contain PTU, got %s", lastContent)
+	// 3 original, PTU stripped → 2
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
 	}
 	// User message still at position 0
 	if gjson.GetBytes(out, "messages.0.content").String() != "hello" {
@@ -830,58 +821,42 @@ func TestReloc_PostToolUseRemoved(t *testing.T) {
 }
 
 func TestReloc_MultiplePTUDedupedAtEnd(t *testing.T) {
-	// Two identical PTU messages → deduplicated to one at end
+	// Two identical PTU messages → both stripped
 	body := []byte(`{"messages":[{"role":"system","content":"PreToolUse:Read hook: read in parallel."},{"role":"user","content":"real query"},{"role":"system","content":"PreToolUse:Read hook: read in parallel."},{"role":"assistant","content":"ok"}]}`)
 	out := RelocateHookMessages(body)
 	if !gjson.ValidBytes(out) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
 	count := gjson.GetBytes(out, "messages.#").Int()
-	// 4 original, 2 PTU removed, 1 unique PTU appended → 3
-	if count != 3 {
-		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	// 4 original, 2 PTU stripped → 2
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
 	}
-	// user "real query" at position 0
 	if gjson.GetBytes(out, "messages.0.content").String() != "real query" {
-		t.Fatalf("expected real query at position 0, got %s", gjson.GetBytes(out, "messages.0.content").String())
+		t.Fatalf("expected real query at position 0")
 	}
-	// assistant at position 1
 	if gjson.GetBytes(out, "messages.1.content").String() != "ok" {
 		t.Fatalf("expected ok at position 1")
-	}
-	// PTU at the end (position 2)
-	lastRole := gjson.GetBytes(out, "messages.2.role").String()
-	if lastRole != "system" {
-		t.Fatalf("expected last message role=system, got %s", lastRole)
 	}
 }
 
 func TestReloc_MixedPTUAndPostToolUse(t *testing.T) {
-	// Mix of PTU, PostToolUse, and real conversation
+	// Mix of PTU, PostToolUse, and real conversation → all hooks stripped
 	body := []byte(`{"messages":[{"role":"user","content":"query"},{"role":"system","content":"PreToolUse:Read hook: parallel reads."},{"role":"user","content":"PostToolUse:Read hook: read 10 files."},{"role":"assistant","content":"response"},{"role":"system","content":"PreToolUse:Edit hook: verify changes."}]}`)
 	out := RelocateHookMessages(body)
 	if !gjson.ValidBytes(out) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
 	count := gjson.GetBytes(out, "messages.#").Int()
-	// 5 original, 2 PTU removed, 1 PostToolUse removed → 2 (query + assistant) + 2 PTU at end = 4
-	if count != 4 {
-		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	// 5 original, 2 PTU stripped, 1 PostToolUse stripped → 2 (query + assistant)
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
 	}
-	// Position 0: user query
 	if gjson.GetBytes(out, "messages.0.role").String() != "user" {
-		t.Fatalf("expected user at position 0, got %s", gjson.GetBytes(out, "messages.0.role").String())
+		t.Fatalf("expected user at position 0")
 	}
-	// Position 1: assistant
 	if gjson.GetBytes(out, "messages.1.role").String() != "assistant" {
 		t.Fatalf("expected assistant at position 1")
-	}
-	// Position 2,3: system PTU
-	if gjson.GetBytes(out, "messages.2.role").String() != "system" {
-		t.Fatalf("expected system PTU at position 2")
-	}
-	if gjson.GetBytes(out, "messages.3.role").String() != "system" {
-		t.Fatalf("expected system PTU at position 3")
 	}
 }
 
@@ -917,26 +892,99 @@ PostToolUse:Read hook additional context: Extensive reading (5 files).
 	if !gjson.ValidBytes(out) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
-	// Original 6: sys, user(PTU), asst, user(PTU dup), user(PostToolUse), asst
-	// After normalize: sys, sys(PTU@1), asst(mid), sys(PTU@3 deduped?), user(PostToolUse@4), asst(end)
-	// Actually: user[0]→sys PTU, user[3](duplicate PTU)→deleted(dedup by norm), user[4](PostToolUse) stays
-	// After normalize: sys, sys(PTU), asst(mid), user(PostToolUse), asst(end) = 5
-	// After dedup: same (no duplicate sys)
-	// After relocate: sys, asst(mid), asst(end), sys(PTU@end) = 4
-	// We don't assert exact count, just that PTU is at end and PostToolUse is gone
+	// After pipeline: sys, asst(mid), asst(end) = 3
+	// All PTU and PostToolUse stripped
 	messages := gjson.GetBytes(out, "messages")
-	lastIdx := int(messages.Get("#").Int()) - 1
-	if messages.Get(fmt.Sprintf("%d.role", lastIdx)).String() != "system" {
-		t.Fatalf("expected PTU at end, got role=%s at last position", messages.Get(fmt.Sprintf("%d.role", lastIdx)).String())
+	count := messages.Get("#").Int()
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
 	}
 	// Verify no PostToolUse anywhere
 	outStr := string(out)
 	if strings.Contains(outStr, "PostToolUse:") {
 		t.Fatalf("PostToolUse should be removed: %s", outStr)
 	}
-	// Verify PTU content preserved
-	if !strings.Contains(outStr, "PreToolUse:Read hook") {
-		t.Fatalf("PTU content missing")
+	// Verify no PTU anywhere
+	if strings.Contains(outStr, "PreToolUse:") {
+		t.Fatalf("PTU should be stripped: %s", outStr)
+	}
+	// Conversation preserved: sys, mid, end
+	if messages.Get("0.content").String() != "You are Claude." {
+		t.Fatalf("expected sys prompt at 0")
+	}
+	if messages.Get("1.content").String() != "mid" {
+		t.Fatalf("expected mid at 1")
+	}
+	if messages.Get("2.content").String() != "end" {
+		t.Fatalf("expected end at 2")
+	}
+}
+
+func TestReloc_PTUDedupWithPostToolUseSuffix(t *testing.T) {
+	// PTU with PostToolUse counters are stripped entirely
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"real query"},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads.\n\nPostToolUse:Read hook additional context: Extensive reading (12 files)."},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads.\n\nPostToolUse:Read hook additional context: Extensive reading (13 files)."},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads.\n\nPostToolUse:Read hook additional context: Extensive reading (14 files)."},
+		{"role":"assistant","content":"end"}
+	]}`)
+
+	out := RelocateHookMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// 6 original, 3 PTU stripped → 3 (sys, user, assistant)
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+
+	// Verify conversation preserved
+	if gjson.GetBytes(out, "messages.0.role").String() != "system" {
+		t.Fatalf("expected system at 0")
+	}
+	if gjson.GetBytes(out, "messages.1.role").String() != "user" {
+		t.Fatalf("expected user at 1")
+	}
+	if gjson.GetBytes(out, "messages.2.role").String() != "assistant" {
+		t.Fatalf("expected assistant at 2")
+	}
+}
+
+func TestStripPostToolUseSuffix(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{
+			"PreToolUse:Read hook\n\nPostToolUse:Read hook (12 files)",
+			"PreToolUse:Read hook",
+		},
+		{
+			"PreToolUse:Read hook\nPostToolUse:Read hook (12 files)",
+			"PreToolUse:Read hook",
+		},
+		{
+			"PreToolUse:Read hook\n\nPostToolUseFailure:something failed",
+			"PreToolUse:Read hook",
+		},
+		{
+			"PreToolUse:Edit hook: verify changes.",
+			"PreToolUse:Edit hook: verify changes.",
+		},
+		{
+			"Plain text without PostToolUse",
+			"Plain text without PostToolUse",
+		},
+	}
+	for _, tc := range tests {
+		got := stripPostToolUseSuffix(tc.input)
+		if got != tc.expected {
+			t.Errorf("stripPostToolUseSuffix(%q) = %q, want %q", tc.input, got, tc.expected)
+		}
 	}
 }
 
@@ -979,5 +1027,68 @@ func TestReloc_RoundBoundarySimulation(t *testing.T) {
 		if rPrev != rNext {
 			t.Fatalf("position %d: expected %s == %s for cache prefix match", i, rPrev, rNext)
 		}
+	}
+}
+
+func TestReorder_SystemMsgsToFront(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"sys1"},
+		{"role":"user","content":"u1"},
+		{"role":"system","content":"sys2"},
+		{"role":"assistant","content":"a1"},
+		{"role":"tool","content":"t1"}
+	]}`)
+
+	out := ReorderSystemMessagesToFront(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// After reorder: [sys1, sys2, u1, a1, t1]
+	expected := []string{"system", "system", "user", "assistant", "tool"}
+	for i, want := range expected {
+		got := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		if got != want {
+			t.Fatalf("position %d: expected %s, got %s", i, want, got)
+		}
+	}
+}
+
+func TestReorder_NoSystemMsgs(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"u1"},{"role":"assistant","content":"a1"}]}`)
+	out := ReorderSystemMessagesToFront(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestReorder_PreservesConversationOrder(t *testing.T) {
+	// Conversation messages keep their relative order
+	body := []byte(`{"messages":[
+		{"role":"system","content":"s1"},
+		{"role":"user","content":"u1"},
+		{"role":"system","content":"s2"},
+		{"role":"assistant","content":"a1"},
+		{"role":"user","content":"u2"},
+		{"role":"system","content":"s3"},
+		{"role":"tool","content":"t1"},
+		{"role":"assistant","content":"a2"}
+	]}`)
+
+	out := ReorderSystemMessagesToFront(body)
+	// After: [s1, s2, s3, u1, a1, u2, t1, a2]
+	expectedRoles := []string{"system", "system", "system", "user", "assistant", "user", "tool", "assistant"}
+	for i, want := range expectedRoles {
+		got := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		if got != want {
+			t.Fatalf("position %d: expected %s, got %s", i, want, got)
+		}
+	}
+	// Conversation relative order: u1, a1, u2, t1, a2
+	if gjson.GetBytes(out, "messages.3.content").String() != "u1" {
+		t.Fatalf("conversation order broken")
+	}
+	if gjson.GetBytes(out, "messages.7.content").String() != "a2" {
+		t.Fatalf("conversation order broken at end")
 	}
 }

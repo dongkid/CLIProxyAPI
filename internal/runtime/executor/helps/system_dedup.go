@@ -448,6 +448,23 @@ func isPTUSystemMessage(m gjson.Result) bool {
 	return content.Type == gjson.String && strings.Contains(content.String(), "PreToolUse:")
 }
 
+// stripPostToolUseSuffix removes the PostToolUse (and PostToolUseFailure)
+// suffix from a PTU content string. CC embeds PostToolUse counters in the
+// same system message, e.g.:
+//
+//	PreToolUse:Read hook...\n\nPostToolUse:Read hook...(12 files)
+//
+// The PostToolUse suffix varies per message (different file counts) which
+// defeats PTU deduplication. Stripping it produces a stable dedup key and
+// removes model-useless counter noise from the output.
+func stripPostToolUseSuffix(ptuText string) string {
+	idx := strings.Index(ptuText, "\nPostToolUse")
+	if idx < 0 {
+		return ptuText
+	}
+	return strings.TrimRight(ptuText[:idx], "\n\r ")
+}
+
 // isPostToolUseUserMessage reports whether a user-role message contains
 // PostToolUse or PostToolUseFailure hook text. Checks both string content
 // and array content. "PostToolUseFailure:" does not contain "PostToolUse:"
@@ -532,8 +549,6 @@ func RelocateHookMessages(body []byte) []byte {
 	}
 
 	arr := msgs.Array()
-	var ptuTexts []string
-	seenPTU := make(map[string]bool)
 	removedPTU := 0
 	removedPost := 0
 
@@ -543,11 +558,6 @@ func RelocateHookMessages(body []byte) []byte {
 
 	for _, m := range arr {
 		if isPTUSystemMessage(m) {
-			ptu := m.Get("content").String()
-			if !seenPTU[ptu] {
-				seenPTU[ptu] = true
-				ptuTexts = append(ptuTexts, ptu)
-			}
 			removedPTU++
 			continue
 		}
@@ -573,18 +583,6 @@ func RelocateHookMessages(body []byte) []byte {
 		buf.WriteString(m.Raw)
 	}
 
-	// Append deduplicated PTU messages at the end
-	for _, pt := range ptuTexts {
-		if !first {
-			buf.WriteByte(',')
-		}
-		first = false
-		buf.WriteString(`{"role":"system","content":`)
-		quoted, _ := json.Marshal(pt)
-		buf.Write(quoted)
-		buf.WriteByte('}')
-	}
-
 	buf.WriteByte(']')
 
 	if removedPTU == 0 && removedPost == 0 {
@@ -600,9 +598,76 @@ func RelocateHookMessages(body []byte) []byte {
 	log.WithFields(log.Fields{
 		"module":       "system_dedup",
 		"ptu_removed":  removedPTU,
-		"ptu_appended": len(ptuTexts),
 		"post_removed": removedPost,
-	}).Debug("system_dedup: relocated hook messages to end [cpa-reloc]")
+	}).Debug("system_dedup: stripped hook messages [cpa-reloc]")
+
+	return result
+}
+
+// ReorderSystemMessagesToFront moves all system-role messages to the
+// beginning of the messages array, leaving user/assistant/tool messages at
+// the end.  This ensures DeepSeek's "end of user input" cache prefix unit
+// snaps at the end of the conversation (the last non-system message)
+// instead of at a trailing block of system hooks or tool definitions.
+//
+// System messages are kept in their original relative order; conversation
+// messages are kept in their original relative order.
+//
+// Logs at debug level when reordering occurs [cpa-reorder].
+func ReorderSystemMessagesToFront(body []byte) []byte {
+	msgs := gjson.GetBytes(body, "messages")
+	if !msgs.IsArray() || len(msgs.Array()) < 2 {
+		return body
+	}
+
+	arr := msgs.Array()
+	sysCount := 0
+	var sysRaws []string
+	var convRaws []string
+
+	for _, m := range arr {
+		if m.Get("role").String() == "system" {
+			sysRaws = append(sysRaws, m.Raw)
+			sysCount++
+		} else {
+			convRaws = append(convRaws, m.Raw)
+		}
+	}
+
+	if sysCount == 0 {
+		return body
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	first := true
+	for _, s := range sysRaws {
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		buf.WriteString(s)
+	}
+	for _, c := range convRaws {
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		buf.WriteString(c)
+	}
+	buf.WriteByte(']')
+
+	result, err := sjson.SetRawBytes(body, "messages", buf.Bytes())
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("reorder: failed to set messages: %v", err)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":      "system_dedup",
+		"system_msgs": sysCount,
+		"conv_msgs":   len(convRaws),
+	}).Debug("system_dedup: reordered system messages to front [cpa-reorder]")
 
 	return result
 }
