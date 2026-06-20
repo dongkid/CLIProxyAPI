@@ -91,6 +91,28 @@ func (e *OpenAICompatExecutor) sessionAffinityHeaderName() string {
 	return strings.TrimSpace(compat.SessionAffinityHeader)
 }
 
+// isCPAStepEnabled returns true when the CPA pipeline step should execute.
+// Defaults to enabled (true) when config, CPAPipeline, or the step pointer is nil.
+func (e *OpenAICompatExecutor) isCPAStepEnabled(step *bool) bool {
+	if step == nil {
+		return true
+	}
+	return *step
+}
+
+// cpaPipeline returns the CPAPipeline config or nil when cfg is nil.
+func (e *OpenAICompatExecutor) cpaPipeline() *config.CPAPipelineConfig {
+	if e.cfg == nil {
+		return nil
+	}
+	return e.cfg.CPAPipeline
+}
+
+// cpaEnabled returns true when the CPA pipeline master switch is on.
+func (e *OpenAICompatExecutor) cpaEnabled() bool {
+	return e.isCPAStepEnabled(e.cpaPipeline().EnableMaster)
+}
+
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
 func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -171,11 +193,23 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
-	translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm] normalize user-role PreToolUse to system-role at inline position
-	translated = helps.DeduplicateSystemMessages(translated)   // [cpa-dedup] remove duplicate consecutive system messages to improve upstream cache hit rate
-	translated = helps.RelocateHookMessages(translated)        // [cpa-reloc] strip PTU+PostToolUse from conversation, append deduped PTU to end for cross-round KV cache stability
-	translated = helps.SortToolsByName(translated)             // [cpa-toolsort] sort top-level tools array by function.name for stable KV cache prefix
-	translated = helps.CanonicalizeJSON(translated)            // [cpa-canon] re-serialize to byte-stable representation for upstream KV cache affinity
+	if e.cpaEnabled() {
+		if e.isCPAStepEnabled(e.cpaPipeline().EnablePTUNormalization) {
+			translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
+			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
+			translated = helps.RelocateHookMessages(translated) // [cpa-reloc]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
+			translated = helps.SortToolsByName(translated) // [cpa-toolsort]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
+			translated = helps.CanonicalizeJSON(translated) // [cpa-canon]
+		}
+	}
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -404,11 +438,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
-	translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm] normalize user-role PreToolUse to system-role at inline position
-	translated = helps.DeduplicateSystemMessages(translated)   // [cpa-dedup] remove duplicate consecutive system messages to improve upstream cache hit rate
-	translated = helps.RelocateHookMessages(translated)        // [cpa-reloc] strip PTU+PostToolUse from conversation, append deduped PTU to end for cross-round KV cache stability
-	translated = helps.SortToolsByName(translated)             // [cpa-toolsort] sort top-level tools array by function.name for stable KV cache prefix
-	translated = helps.CanonicalizeJSON(translated)            // [cpa-canon] re-serialize to byte-stable representation for upstream KV cache affinity
+	if e.cpaEnabled() {
+		if e.isCPAStepEnabled(e.cpaPipeline().EnablePTUNormalization) {
+			translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
+			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
+			translated = helps.RelocateHookMessages(translated) // [cpa-reloc]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
+			translated = helps.SortToolsByName(translated) // [cpa-toolsort]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
+			translated = helps.CanonicalizeJSON(translated) // [cpa-canon]
+		}
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))

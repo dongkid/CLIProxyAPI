@@ -26,6 +26,37 @@ const (
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
+// CPAPipelineConfig controls individual steps of the Cache Preservation
+// Architecture pipeline. Each step can be toggled independently for
+// debugging and optimization.
+type CPAPipelineConfig struct {
+	// EnableMaster is the master switch for the entire CPA pipeline.
+	// When explicitly set to false, all steps are skipped regardless of
+	// their individual settings. Defaults to true.
+	EnableMaster *bool `yaml:"enable,omitempty" json:"enable,omitempty"`
+
+	// EnablePTUNormalization controls [cpa-norm]: extracts PreToolUse hook
+	// context from user messages and promotes them to system-role messages.
+	EnablePTUNormalization *bool `yaml:"enable-ptu-normalization,omitempty" json:"enable-ptu-normalization,omitempty"`
+
+	// EnableSystemDedup controls [cpa-dedup]: removes byte-identical
+	// duplicate system messages, keeping only the first occurrence.
+	EnableSystemDedup *bool `yaml:"enable-system-dedup,omitempty" json:"enable-system-dedup,omitempty"`
+
+	// EnableHookRelocation controls [cpa-reloc]: strips PreToolUse system
+	// messages and PostToolUse user messages from the conversation to
+	// produce a hook-free prefix for cross-round KV cache hits.
+	EnableHookRelocation *bool `yaml:"enable-hook-relocation,omitempty" json:"enable-hook-relocation,omitempty"`
+
+	// EnableToolSort controls [cpa-toolsort]: sorts the top-level tools
+	// array alphabetically by function.name for a stable KV cache prefix.
+	EnableToolSort *bool `yaml:"enable-tool-sort,omitempty" json:"enable-tool-sort,omitempty"`
+
+	// EnableCanonicalize controls [cpa-canon]: re-serializes JSON to a
+	// byte-stable deterministic representation for upstream KV cache affinity.
+	EnableCanonicalize *bool `yaml:"enable-canonicalize,omitempty" json:"enable-canonicalize,omitempty"`
+}
+
 type Config struct {
 	SDKConfig `yaml:",inline"`
 	// Host is the network host/interface on which the API server will bind.
@@ -54,6 +85,10 @@ type Config struct {
 
 	// CommercialMode disables high-overhead HTTP middleware features to minimize per-request memory usage.
 	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
+
+	// CPAPipeline provides per-step toggles for the Cache Preservation
+	// Architecture pipeline. When nil, all steps default to enabled.
+	CPAPipeline *CPAPipelineConfig `yaml:"cpa-cache,omitempty" json:"cpa-cache,omitempty"`
 
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
@@ -664,12 +699,38 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	// Initialize CPA pipeline config so YAML can populate sub-keys.
+	cfg.CPAPipeline = &CPAPipelineConfig{}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			return &Config{}, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// CPA pipeline defaults: all steps enabled unless explicitly disabled.
+	if cfg.CPAPipeline == nil {
+		cfg.CPAPipeline = &CPAPipelineConfig{}
+	}
+	tru := true
+	if cfg.CPAPipeline.EnableMaster == nil {
+		cfg.CPAPipeline.EnableMaster = &tru
+	}
+	if cfg.CPAPipeline.EnablePTUNormalization == nil {
+		cfg.CPAPipeline.EnablePTUNormalization = &tru
+	}
+	if cfg.CPAPipeline.EnableSystemDedup == nil {
+		cfg.CPAPipeline.EnableSystemDedup = &tru
+	}
+	if cfg.CPAPipeline.EnableHookRelocation == nil {
+		cfg.CPAPipeline.EnableHookRelocation = &tru
+	}
+	if cfg.CPAPipeline.EnableToolSort == nil {
+		cfg.CPAPipeline.EnableToolSort = &tru
+	}
+	if cfg.CPAPipeline.EnableCanonicalize == nil {
+		cfg.CPAPipeline.EnableCanonicalize = &tru
 	}
 
 	// NOTE: Startup legacy key migration is intentionally disabled.

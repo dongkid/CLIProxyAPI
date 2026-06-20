@@ -52,6 +52,34 @@ pprof:
 # When true, disable high-overhead HTTP middleware features to reduce per-request memory usage under high concurrency.
 commercial-mode: false
 
+# Cache Preservation Architecture (CPA) pipeline step toggles.
+# Each step is enabled by default. Disable individual steps to isolate
+# their impact on cache hit rate during debugging and optimization.
+cpa-cache:
+  # Master switch for the entire CPA pipeline. Set to false to bypass
+  # all steps at once (e.g. for A/B testing cache impact).
+  # enable: true
+
+  # [cpa-norm] Extract PreToolUse hook context from user messages and
+  # promote to system-role. Normalizes CC's variable injection formats.
+  # enable-ptu-normalization: true
+
+  # [cpa-dedup] Remove byte-identical duplicate system messages,
+  # keeping only the first occurrence.
+  # enable-system-dedup: true
+
+  # [cpa-reloc] Strip PreToolUse system messages and PostToolUse user
+  # messages from the conversation for a hook-free cross-round prefix.
+  # enable-hook-relocation: true
+
+  # [cpa-toolsort] Sort the tools array alphabetically by function.name
+  # for a stable KV cache prefix across rounds.
+  # enable-tool-sort: true
+
+  # [cpa-canon] Re-serialize JSON to a deterministic byte-stable form
+  # for upstream KV cache affinity.
+  # enable-canonicalize: true
+
 # When true, write application logs to rotating files instead of stdout
 logging-to-file: false
 

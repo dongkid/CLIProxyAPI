@@ -30,6 +30,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	// Initialize CPA pipeline config so YAML can populate sub-keys.
+	cfg.CPAPipeline = &CPAPipelineConfig{}
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
@@ -71,6 +73,30 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
+	}
+
+	// CPA pipeline defaults: all steps enabled unless explicitly disabled.
+	if cfg.CPAPipeline == nil {
+		cfg.CPAPipeline = &CPAPipelineConfig{}
+	}
+	tru := true
+	if cfg.CPAPipeline.EnableMaster == nil {
+		cfg.CPAPipeline.EnableMaster = &tru
+	}
+	if cfg.CPAPipeline.EnablePTUNormalization == nil {
+		cfg.CPAPipeline.EnablePTUNormalization = &tru
+	}
+	if cfg.CPAPipeline.EnableSystemDedup == nil {
+		cfg.CPAPipeline.EnableSystemDedup = &tru
+	}
+	if cfg.CPAPipeline.EnableHookRelocation == nil {
+		cfg.CPAPipeline.EnableHookRelocation = &tru
+	}
+	if cfg.CPAPipeline.EnableToolSort == nil {
+		cfg.CPAPipeline.EnableToolSort = &tru
+	}
+	if cfg.CPAPipeline.EnableCanonicalize == nil {
+		cfg.CPAPipeline.EnableCanonicalize = &tru
 	}
 
 	// Apply the same sanitization pipeline.
