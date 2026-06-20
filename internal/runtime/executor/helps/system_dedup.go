@@ -438,14 +438,19 @@ func hashContent(content string) string {
 	return fmt.Sprintf("%x", h)
 }
 
-// isPTUSystemMessage reports whether a message is a system-role PTU hook.
-// Detection: role=system, content is string, contains "PreToolUse:".
+// isPTUSystemMessage reports whether a message is a system-role CC hook
+// that should be stripped. Detection: role=system, content is string,
+// contains "PreToolUse:" or "PostToolUseFailure:".
 func isPTUSystemMessage(m gjson.Result) bool {
 	if m.Get("role").String() != "system" {
 		return false
 	}
 	content := m.Get("content")
-	return content.Type == gjson.String && strings.Contains(content.String(), "PreToolUse:")
+	if content.Type != gjson.String {
+		return false
+	}
+	s := content.String()
+	return strings.Contains(s, "PreToolUse:") || strings.Contains(s, "PostToolUseFailure:")
 }
 
 // stripPostToolUseSuffix removes the PostToolUse (and PostToolUseFailure)

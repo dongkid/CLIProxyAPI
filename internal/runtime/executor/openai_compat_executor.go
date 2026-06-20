@@ -174,6 +174,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm] normalize user-role PreToolUse to system-role at inline position
 	translated = helps.DeduplicateSystemMessages(translated)   // [cpa-dedup] remove duplicate consecutive system messages to improve upstream cache hit rate
 	translated = helps.RelocateHookMessages(translated)        // [cpa-reloc] strip PTU+PostToolUse from conversation, append deduped PTU to end for cross-round KV cache stability
+	translated = helps.SortToolsByName(translated)             // [cpa-toolsort] sort top-level tools array by function.name for stable KV cache prefix
 	translated = helps.CanonicalizeJSON(translated)            // [cpa-canon] re-serialize to byte-stable representation for upstream KV cache affinity
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
@@ -406,6 +407,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm] normalize user-role PreToolUse to system-role at inline position
 	translated = helps.DeduplicateSystemMessages(translated)   // [cpa-dedup] remove duplicate consecutive system messages to improve upstream cache hit rate
 	translated = helps.RelocateHookMessages(translated)        // [cpa-reloc] strip PTU+PostToolUse from conversation, append deduped PTU to end for cross-round KV cache stability
+	translated = helps.SortToolsByName(translated)             // [cpa-toolsort] sort top-level tools array by function.name for stable KV cache prefix
 	translated = helps.CanonicalizeJSON(translated)            // [cpa-canon] re-serialize to byte-stable representation for upstream KV cache affinity
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"

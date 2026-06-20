@@ -1092,3 +1092,38 @@ func TestReorder_PreservesConversationOrder(t *testing.T) {
 		t.Fatalf("conversation order broken at end")
 	}
 }
+
+func TestReloc_PostToolUseFailureSystemMessage(t *testing.T) {
+	// Real-world: CC injects PostToolUseFailure as a SYSTEM message (not user).
+	// This was missed because isPostToolUseUserMessage only checks role=user.
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"real query"},
+		{"role":"system","content":"PostToolUseFailure:mcp__chrome-devtools__evaluate_script hook additional context: Tool failed. Analyze the error."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := RelocateHookMessages(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// 4 original, 1 PTU(PostToolUseFailure as system) stripped → 3
+	if count != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", count, string(out))
+	}
+
+	if gjson.GetBytes(out, "messages.0.role").String() != "system" {
+		t.Fatalf("expected system at 0")
+	}
+	if gjson.GetBytes(out, "messages.2.role").String() != "assistant" {
+		t.Fatalf("expected assistant at 2, got %s", string(out))
+	}
+
+	// Verify PostToolUseFailure was removed
+	outStr := string(out)
+	if strings.Contains(outStr, "PostToolUseFailure") {
+		t.Fatalf("PostToolUseFailure should be stripped")
+	}
+}

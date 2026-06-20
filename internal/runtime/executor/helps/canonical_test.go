@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestCanonical_IdenticalInputProducesIdenticalOutput(t *testing.T) {
@@ -101,5 +103,38 @@ PreToolUse:Read hook additional context: Read multiple files in parallel when po
 	canonical2 := CanonicalizeJSON(normalized)
 	if string(canonical) != string(canonical2) {
 		t.Fatalf("normalize+canonicalize must be deterministic")
+	}
+}
+
+func TestToolsort_SortsAlphabetically(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"zebra","description":"z"}},{"type":"function","function":{"name":"apple","description":"a"}},{"type":"function","function":{"name":"moon","description":"m"}}]}`)
+	out := SortToolsByName(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	names := gjson.GetBytes(out, "tools.#.function.name").Array()
+	expected := []string{"apple", "moon", "zebra"}
+	for i, want := range expected {
+		got := names[i].String()
+		if got != want {
+			t.Fatalf("position %d: expected %s, got %s", i, want, got)
+		}
+	}
+}
+
+func TestToolsort_NoTools(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	out := SortToolsByName(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change")
+	}
+}
+
+func TestToolsort_AlreadySorted(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"a"}},{"type":"function","function":{"name":"b"}}]}`)
+	out := SortToolsByName(body)
+	// Should be unchanged (already sorted)
+	if string(out) != string(body) {
+		t.Fatalf("already sorted should not change: got %s", string(out))
 	}
 }
