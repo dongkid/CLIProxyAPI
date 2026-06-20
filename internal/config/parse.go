@@ -98,6 +98,10 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if cfg.CPAPipeline.EnableCanonicalize == nil {
 		cfg.CPAPipeline.EnableCanonicalize = &tru
 	}
+	if cfg.CPAPipeline.EnableHookReanchor == nil {
+		fals := false
+		cfg.CPAPipeline.EnableHookReanchor = &fals
+	}
 
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()

@@ -1127,3 +1127,371 @@ func TestReloc_PostToolUseFailureSystemMessage(t *testing.T) {
 		t.Fatalf("PostToolUseFailure should be stripped")
 	}
 }
+
+// --- ReanchorHooks tests ---
+
+func TestReanchor_NoHooks(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}`)
+	out := ReanchorHooks(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestReanchor_PTUAnchoredToTool(t *testing.T) {
+	// System PTU after tool message → anchored into tool content
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"read file"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"file contents here"},
+		{"role":"system","content":"PreToolUse:Read hook additional context: Read files in parallel."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// Hook anchored: 6 original → 5 (PTU absorbed into tool)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	}
+
+	// Tool content should now include hook text
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(toolContent, "file contents here") {
+		t.Fatalf("tool content should retain original output")
+	}
+	if !strings.Contains(toolContent, "[hook:PreToolUse:Read]") {
+		t.Fatalf("tool content should contain anchored hook label, got: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "Read files in parallel") {
+		t.Fatalf("tool content should contain hook text, got: %s", toolContent)
+	}
+
+	// Hook message should be gone
+	for i := int64(0); i < count; i++ {
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if strings.Contains(c, "PreToolUse:") && gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String() != "tool" {
+			t.Fatalf("PTU should no longer be a standalone message at index %d: %s", i, c)
+		}
+	}
+}
+
+func TestReanchor_PostToolUseAnchoredToTool(t *testing.T) {
+	// User-role PostToolUse after tool → anchored into tool content
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"command output"},
+		{"role":"user","content":"PostToolUse:Bash hook additional context: Command succeeded."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	}
+
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(toolContent, "[hook:PostToolUse:Bash]") {
+		t.Fatalf("tool content should contain PostToolUse label, got: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "Command succeeded") {
+		t.Fatalf("tool content should contain hook text, got: %s", toolContent)
+	}
+}
+
+func TestReanchor_PostToolUseFailureAnchoredToTool(t *testing.T) {
+	// System-role PostToolUseFailure after tool → anchored
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"mcp__chrome","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"error output"},
+		{"role":"system","content":"PostToolUseFailure:mcp__chrome-devtools__evaluate_script hook additional context: Tool failed."},
+		{"role":"assistant","content":"retrying"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	}
+
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(toolContent, "[hook:PostToolUseFailure:mcp__chrome") {
+		t.Fatalf("tool content should contain PostToolUseFailure label, got: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "Tool failed") {
+		t.Fatalf("tool content should contain failure text, got: %s", toolContent)
+	}
+}
+
+func TestReanchor_MultipleHooksAnchoredToSameTool(t *testing.T) {
+	// Two consecutive hook messages after tool → both anchored
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"file output"},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads."},
+		{"role":"user","content":"PostToolUse:Read hook additional context: read 10 files."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// 7 original, 2 hooks anchored → 5
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	}
+
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(toolContent, "[hook:PreToolUse:Read]") {
+		t.Fatalf("missing PreToolUse label in: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "[hook:PostToolUse:Read]") {
+		t.Fatalf("missing PostToolUse label in: %s", toolContent)
+	}
+}
+
+func TestReanchor_HookNotAdjacentToToolKeptAsIs(t *testing.T) {
+	// Hook NOT after a tool (separated by assistant) → kept as standalone message
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"thinking..."},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads."},
+		{"role":"user","content":"next question"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// No tool before hook → hook kept, message count unchanged
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages (no change), got %d: %s", count, string(out))
+	}
+
+	// PTU should still exist as standalone system message
+	found := false
+	for i := int64(0); i < count; i++ {
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		if r == "system" && strings.Contains(c, "PreToolUse:Read") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("PTU without adjacent tool should be preserved: %s", string(out))
+	}
+}
+
+func TestReanchor_PostToolUseFailureLookback(t *testing.T) {
+	// PostToolUseFailure 2 positions after tool (with user message in between) → anchored via look-back
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"bash output"},
+		{"role":"user","content":"more context"},
+		{"role":"system","content":"PostToolUseFailure:mcp__tool hook: Tool error."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// PostToolUseFailure 2 away from tool → look-back succeeds → anchored
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 6 {
+		t.Fatalf("expected 6 messages, got %d: %s", count, string(out))
+	}
+
+	// Check that hook was anchored (no standalone PostToolUseFailure message)
+	for i := int64(0); i < count; i++ {
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		if r == "system" && strings.Contains(c, "PostToolUseFailure") {
+			t.Fatalf("PostToolUseFailure should be anchored, not standalone at %d: %s", i, c)
+		}
+	}
+}
+
+func TestReanchor_PreservesConversationContent(t *testing.T) {
+	// Verify all non-hook messages remain unchanged
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"what is the weather"},
+		{"role":"assistant","content":"let me check","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"sunny 72F"},
+		{"role":"system","content":"PreToolUse:get_weather hook additional context: Verify with secondary source."},
+		{"role":"assistant","content":"The weather is sunny, 72F."}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// System prompt unchanged
+	if gjson.GetBytes(out, "messages.0.content").String() != "You are Claude." {
+		t.Fatalf("system prompt changed")
+	}
+	// User query unchanged
+	if gjson.GetBytes(out, "messages.1.content").String() != "what is the weather" {
+		t.Fatalf("user query changed")
+	}
+	// Final assistant unchanged
+	if gjson.GetBytes(out, "messages.4.content").String() != "The weather is sunny, 72F." {
+		t.Fatalf("assistant response changed")
+	}
+}
+
+func TestReanchor_StripPostToolUseSuffix(t *testing.T) {
+	// PTU with PostToolUse counter suffix → suffix stripped before anchoring
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"output"},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads.\n\nPostToolUse:Read hook additional context: Extensive reading (12 files)."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	// Suffix "(12 files)" should not appear
+	if strings.Contains(toolContent, "12 files") {
+		t.Fatalf("PostToolUse suffix noise should be stripped, got: %s", toolContent)
+	}
+	// Core PTU content should remain
+	if !strings.Contains(toolContent, "parallel reads") {
+		t.Fatalf("core PTU content should be preserved: %s", toolContent)
+	}
+}
+
+func TestReanchor_SystemReminderWrapperStripped(t *testing.T) {
+	// User-role PostToolUse with <system-reminder> wrapper → stripped
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Edit","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"edited"},
+		{"role":"user","content":"<system-reminder>\nPostToolUse:Edit hook additional context: Verify syntax after edit.\n</system-reminder>"},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if strings.Contains(toolContent, "<system-reminder>") {
+		t.Fatalf("system-reminder wrapper should be stripped, got: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "Verify syntax after edit") {
+		t.Fatalf("hook text should be preserved: %s", toolContent)
+	}
+}
+
+func TestReanchor_FullPipelineWithReanchor(t *testing.T) {
+	// Full pipeline: normalize → dedup → reanchor → canonical
+	// Realistic scenario: PTU and PostToolUse hook messages after a tool result
+	ptuText := `<system-reminder>
+PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
+</system-reminder>`
+	postText := `<system-reminder>
+PostToolUse:Read hook additional context: Extensive reading (5 files).
+</system-reminder>`
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"read the file"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"tool output"},
+		{"role":"user","content":[{"type":"text","text":"` + ptuText + `"}]},
+		{"role":"user","content":[{"type":"text","text":"` + postText + `"}]},
+		{"role":"assistant","content":"end"}
+	]}`)
+	out := NormalizePreToolUseMessages(body)
+	out = DeduplicateSystemMessages(out)
+	out = ReanchorHooks(out)
+	out = CanonicalizeJSON(out)
+
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// After pipeline: sys, usr, asst, tool(anchored), asst = 5
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	}
+
+	// Tool content should have anchored hook text from both PTU and PostToolUse
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(toolContent, "[hook:PreToolUse:Read]") {
+		t.Fatalf("tool content should contain PreToolUse hook, got: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "[hook:PostToolUse:Read]") {
+		t.Fatalf("tool content should contain PostToolUse hook, got: %s", toolContent)
+	}
+	if !strings.Contains(toolContent, "parallel") {
+		t.Fatalf("tool content should contain PreToolUse body text: %s", toolContent)
+	}
+
+	// No standalone hook messages remain (only 1 system: "You are Claude.")
+	sysCount := 0
+	for i := int64(0); i < count; i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		if r == "system" {
+			sysCount++
+		}
+	}
+	if sysCount != 1 {
+		t.Fatalf("expected 1 system message, got %d: %s", sysCount, string(out))
+	}
+
+	// No PostToolUse in output as standalone message
+	outStr := string(out)
+	hookRoles := 0
+	for i := int64(0); i < count; i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if (r == "system" || r == "user") && (strings.Contains(c, "PreToolUse:") || strings.Contains(c, "PostToolUse:")) {
+			hookRoles++
+		}
+	}
+	if hookRoles > 0 {
+		t.Fatalf("hooks should be anchored into tool content, not standalone: %s", outStr)
+	}
+}

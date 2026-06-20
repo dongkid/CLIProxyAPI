@@ -48,6 +48,14 @@ type CPAPipelineConfig struct {
 	// produce a hook-free prefix for cross-round KV cache hits.
 	EnableHookRelocation *bool `yaml:"enable-hook-relocation,omitempty" json:"enable-hook-relocation,omitempty"`
 
+	// EnableHookReanchor controls [cpa-reanchor]: appends hook context
+	// (PreToolUse, PostToolUse, PostToolUseFailure) into the content of
+	// the preceding tool-role message instead of keeping them as separate
+	// messages. This preserves hook content for the model while reducing
+	// message count variation for KV cache stability. Runs before
+	// HookRelocation; hooks already anchored are not relocated.
+	EnableHookReanchor *bool `yaml:"enable-hook-reanchor,omitempty" json:"enable-hook-reanchor,omitempty"`
+
 	// EnableToolSort controls [cpa-toolsort]: sorts the top-level tools
 	// array alphabetically by function.name for a stable KV cache prefix.
 	EnableToolSort *bool `yaml:"enable-tool-sort,omitempty" json:"enable-tool-sort,omitempty"`
@@ -731,6 +739,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if cfg.CPAPipeline.EnableCanonicalize == nil {
 		cfg.CPAPipeline.EnableCanonicalize = &tru
+	}
+	if cfg.CPAPipeline.EnableHookReanchor == nil {
+		fals := false
+		cfg.CPAPipeline.EnableHookReanchor = &fals
 	}
 
 	// NOTE: Startup legacy key migration is intentionally disabled.

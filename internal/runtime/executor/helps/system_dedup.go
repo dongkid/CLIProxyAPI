@@ -609,6 +609,242 @@ func RelocateHookMessages(body []byte) []byte {
 	return result
 }
 
+// ReanchorHooks appends hook context (PreToolUse, PostToolUse,
+// PostToolUseFailure) into the content of the preceding tool-role message
+// instead of leaving them as standalone messages in the array. This
+// preserves hook content for the model while reducing per-request message
+// count variation, stabilising DeepSeek KV cache prefix units.
+//
+// Anchor rules:
+//   - Hook messages immediately following a tool message are anchored to
+//     that tool's content with a "[hook:...]" label prefix.
+//   - Consecutive hook messages all anchor to the same preceding tool.
+//   - PostToolUseFailure (role=system) may appear farther from its tool;
+//     a look-back of up to 3 messages finds the nearest tool to anchor to.
+//     If no tool is found within that window the message is kept as-is.
+//   - User-role PostToolUse messages have their content extracted from
+//     string or array format, stripped of <system-reminder> wrappers,
+//     and the PostToolUse suffix noise removed via stripPostToolUseSuffix.
+//
+// Hooks already anchored by this function are not re-detected by
+// isPTUSystemMessage / isPostToolUseUserMessage in downstream steps
+// because they become part of the tool message's content string.
+//
+// Logs at debug level when hooks are anchored [cpa-reanchor].
+func ReanchorHooks(body []byte) []byte {
+	msgs := gjson.GetBytes(body, "messages")
+	if !msgs.IsArray() || len(msgs.Array()) < 2 {
+		return body
+	}
+
+	arr := msgs.Array()
+	// Pass 1: identify which indices are hook messages and build
+	// anchor assignments (hook index → target tool index).
+	type anchor struct {
+		toolIdx int
+	}
+	anchors := make(map[int]anchor)
+	lastToolIdx := -1
+
+	for i := range arr {
+		role := arr[i].Get("role").String()
+
+		if role == "tool" {
+			lastToolIdx = i
+			continue
+		}
+
+		if isHookForReanchor(arr[i]) {
+			if lastToolIdx >= 0 {
+				anchors[i] = anchor{toolIdx: lastToolIdx}
+			} else {
+				// Look back for a tool message up to 3 positions.
+				for j := i - 1; j >= 0 && j >= i-3; j-- {
+					if arr[j].Get("role").String() == "tool" {
+						lastToolIdx = j
+						break
+					}
+				}
+				if lastToolIdx >= 0 {
+					anchors[i] = anchor{toolIdx: lastToolIdx}
+				}
+			}
+			continue
+		}
+
+		// Non-tool, non-hook message resets the anchor chain.
+		// PTU/PostToolUse only anchor to the immediately preceding tool;
+		// an intervening assistant/user breaks the chain.
+		if !isHookForReanchor(arr[i]) {
+			lastToolIdx = -1
+		}
+	}
+
+	if len(anchors) == 0 {
+		return body
+	}
+
+	// Pass 2: build anchored tool content strings.
+	// Group hook indices by their anchor tool index.
+	toolHooks := make(map[int][]int)
+	for hookIdx, a := range anchors {
+		toolHooks[a.toolIdx] = append(toolHooks[a.toolIdx], hookIdx)
+	}
+
+	// Build updated tool content for each anchored tool.
+	toolReplacements := make(map[int]string)
+	for toolIdx, hookIdxs := range toolHooks {
+		origContent := arr[toolIdx].Get("content").String()
+		var sb strings.Builder
+		sb.WriteString(origContent)
+		for _, hi := range hookIdxs {
+			hookLabel, hookText := extractHookForReanchor(arr[hi])
+			sb.WriteString("\n\n[hook:")
+			sb.WriteString(hookLabel)
+			sb.WriteString("] ")
+			sb.WriteString(hookText)
+		}
+		toolReplacements[toolIdx] = sb.String()
+	}
+
+	// Pass 3: rebuild messages array, applying tool content replacements
+	// and skipping anchored hook messages.
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	first := true
+
+	for i := range arr {
+		if _, isAnchored := anchors[i]; isAnchored {
+			continue
+		}
+
+		if repl, ok := toolReplacements[i]; ok {
+			// Replace this tool message's content string.
+			updated, err := sjson.SetBytes([]byte(arr[i].Raw), "content", repl)
+			if err != nil {
+				log.WithField("module", "system_dedup").Warnf("reanchor: failed to set tool content at %d: %v", i, err)
+				updated = []byte(arr[i].Raw)
+			}
+			if !first {
+				buf.WriteByte(',')
+			}
+			first = false
+			buf.Write(updated)
+			continue
+		}
+
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		buf.WriteString(arr[i].Raw)
+	}
+	buf.WriteByte(']')
+
+	result, err := sjson.SetRawBytes(body, "messages", buf.Bytes())
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("reanchor: failed to set messages: %v", err)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":   "system_dedup",
+		"anchored": len(anchors),
+	}).Debug("system_dedup: anchored hook messages into tool content [cpa-reanchor]")
+
+	return result
+}
+
+// isHookForReanchor reports whether a message is a hook that should be
+// anchored into the preceding tool's content. Covers:
+//   - system-role PreToolUse / PostToolUseFailure
+//   - user-role PostToolUse / PostToolUseFailure
+func isHookForReanchor(m gjson.Result) bool {
+	if isPTUSystemMessage(m) {
+		return true
+	}
+	if isPostToolUseUserMessage(m) {
+		return true
+	}
+	return false
+}
+
+// extractHookForReanchor extracts a human-readable label and the cleaned
+// hook text from a hook message. The label is the hook type prefix
+// (e.g. "PreToolUse:Read", "PostToolUseFailure:mcp__..."). The text is
+// stripped of <system-reminder> wrappers and PostToolUse suffix noise.
+func extractHookForReanchor(m gjson.Result) (label, text string) {
+	content := m.Get("content")
+	var raw string
+	if content.Type == gjson.String {
+		raw = content.String()
+	} else if content.IsArray() {
+		for _, elem := range content.Array() {
+			if elem.Get("type").String() == "text" {
+				t := elem.Get("text").String()
+				if strings.Contains(t, "PreToolUse:") ||
+					strings.Contains(t, "PostToolUse:") ||
+					strings.Contains(t, "PostToolUseFailure:") {
+					raw = t
+					break
+				}
+			}
+		}
+		if raw == "" {
+			raw = content.Raw
+		}
+	} else {
+		raw = content.Raw
+	}
+
+	raw = strings.TrimSpace(raw)
+	// Strip <system-reminder> wrapper if present.
+	if strings.HasPrefix(raw, "<system-reminder>") {
+		idx := strings.Index(raw, ">")
+		if idx >= 0 {
+			raw = raw[idx+1:]
+		}
+		idx = strings.LastIndex(raw, "<")
+		if idx >= 0 {
+			raw = raw[:idx]
+		}
+		raw = strings.TrimSpace(raw)
+	}
+
+	// Extract label from the hook prefix.
+	label = extractHookLabel(raw)
+
+	// Remove PostToolUse suffix noise for stable dedup anchors.
+	cleaned := stripPostToolUseSuffix(raw)
+	return label, cleaned
+}
+
+// extractHookLabel extracts the hook type identifier from the hook text
+// prefix, e.g. "PreToolUse:Bash" or "PostToolUseFailure:mcp__chrome".
+func extractHookLabel(text string) string {
+	text = strings.TrimSpace(text)
+	for _, prefix := range []string{"PreToolUse:", "PostToolUseFailure:", "PostToolUse:"} {
+		if strings.HasPrefix(text, prefix) {
+			rest := text[len(prefix):]
+			// Take up to the first space or colon for the tool name.
+			end := strings.IndexAny(rest, " \t\n:(")
+			if end < 0 {
+				end = len(rest)
+			}
+			toolName := rest[:end]
+			if toolName == "" {
+				return prefix[:len(prefix)-1] // "PreToolUse", "PostToolUse", etc.
+			}
+			return prefix + toolName
+		}
+	}
+	// Fallback: first 40 chars.
+	if len(text) > 40 {
+		return text[:40]
+	}
+	return text
+}
+
 // ReorderSystemMessagesToFront moves all system-role messages to the
 // beginning of the messages array, leaving user/assistant/tool messages at
 // the end.  This ensures DeepSeek's "end of user input" cache prefix unit

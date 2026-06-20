@@ -200,6 +200,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
 		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
+			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
+		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
 			translated = helps.RelocateHookMessages(translated) // [cpa-reloc]
 		}
@@ -444,6 +447,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
+		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
+			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
 			translated = helps.RelocateHookMessages(translated) // [cpa-reloc]
