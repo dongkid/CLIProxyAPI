@@ -63,6 +63,22 @@ type CPAPipelineConfig struct {
 	// EnableCanonicalize controls [cpa-canon]: re-serializes JSON to a
 	// byte-stable deterministic representation for upstream KV cache affinity.
 	EnableCanonicalize *bool `yaml:"enable-canonicalize,omitempty" json:"enable-canonicalize,omitempty"`
+
+	// EnableReorderJSON controls [cpa-reorder-json]: replaces CanonicalizeJSON
+	// with a custom serializer that places stable content (model, tools) before
+	// variable content (messages), so that message growth never shifts the byte
+	// offset of preceding fields. DeepSeek prefix-cache then hits on the entire
+	// stable prefix — model headers + tools — regardless of message count.
+	EnableReorderJSON *bool `yaml:"enable-reorder-json,omitempty" json:"enable-reorder-json,omitempty"`
+
+	// EnableTaskCollapse controls [cpa-task-collapse]: collapses multiple
+	// Claude Code task reminder system messages (which vary only in shown
+	// task list) into a single message, keeping the most recent copy. This
+	// prevents the system message count from growing indefinitely across
+	// multi-task sessions, which would otherwise cause DeepSeek's chat
+	// template to produce a growing system-prompt prefix that shifts all
+	// downstream token positions and invalidates KV cache units.
+	EnableTaskCollapse *bool `yaml:"enable-task-collapse,omitempty" json:"enable-task-collapse,omitempty"`
 }
 
 type Config struct {
@@ -743,6 +759,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.CPAPipeline.EnableHookReanchor == nil {
 		fals := false
 		cfg.CPAPipeline.EnableHookReanchor = &fals
+	}
+	if cfg.CPAPipeline.EnableReorderJSON == nil {
+		fals := false
+		cfg.CPAPipeline.EnableReorderJSON = &fals
 	}
 
 	// NOTE: Startup legacy key migration is intentionally disabled.

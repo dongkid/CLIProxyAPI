@@ -98,6 +98,317 @@ func DeduplicateSystemMessages(body []byte) []byte {
 	return out
 }
 
+// taskReminderPrefix is the fixed preamble Claude Code uses for periodic
+// task tool reminders. CollapseTaskReminders uses it for identification.
+const taskReminderPrefix = "The task tools haven't been used recently"
+
+// taskListMarker separates the stable preamble from the variable task list
+// inside CC's task reminders.
+const taskListMarker = "\n\nHere are the existing tasks:"
+
+// anchorTag is placed in the system reminder preamble after the task list
+// is extracted, telling the model where to find it.
+const anchorTag = "\n\n[current task list follows in conversation]"
+
+// CollapseTaskReminders collapses multiple Claude Code task reminder
+// system messages into a single message and splits it into two parts:
+//
+//   - The stable preamble stays as a role=system message, keeping its
+//     high attention priority in DeepSeek's system-prompt block.
+//   - The variable task list is extracted into a separate role=user
+//     message, wrapped in [task-list] markers. If a task-list user
+//     message from a previous split already exists its content is
+//     replaced rather than duplicated.
+//
+// On subsequent requests the split is idempotent: the preamble no
+// longer contains the task-list marker, so splitTaskReminder returns
+// an empty taskList and the function returns without changes.
+//
+// This solves the KV cache problem: the system block (preamble only)
+// is now byte-stable across all requests, so the tools section never
+// shifts. The model retains access to both the task-tool prompt
+// (system, high priority) and the current task list (user, stable cache).
+//
+// Logs at debug level when reminders are collapsed or split
+// [cpa-task-collapse].
+func CollapseTaskReminders(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() || len(messages.Array()) < 2 {
+		return body
+	}
+
+	arr := messages.Array()
+	reminderIdxs := make([]int, 0)
+	var fullContent string
+
+	for i := range arr {
+		role := arr[i].Get("role").String()
+		if role != "system" {
+			continue
+		}
+		content := arr[i].Get("content")
+		if content.Type == gjson.String && strings.HasPrefix(content.String(), taskReminderPrefix) {
+			reminderIdxs = append(reminderIdxs, i)
+			fullContent = content.String()
+		}
+	}
+
+	if len(reminderIdxs) == 0 {
+		return body
+	}
+
+	origKeepIdx := reminderIdxs[len(reminderIdxs)-1]
+
+	out := body
+
+	if len(reminderIdxs) > 1 {
+		removeIdxs := reminderIdxs[:len(reminderIdxs)-1]
+
+		for _, idx := range removeIdxs {
+			log.WithFields(log.Fields{
+				"module":  "system_dedup",
+				"at":      idx,
+				"keep_at": origKeepIdx,
+			}).Debug("system_dedup: collapsing stale task reminder [cpa-task-collapse]")
+		}
+
+		collapsed := 0
+		for i := len(removeIdxs) - 1; i >= 0; i-- {
+			path := fmt.Sprintf("messages.%d", removeIdxs[i])
+			var err error
+			out, err = sjson.DeleteBytes(out, path)
+			if err != nil {
+				log.WithField("module", "system_dedup").Warnf("task-collapse: failed to delete messages.%d: %v", removeIdxs[i], err)
+				return body
+			}
+			collapsed++
+		}
+
+		log.WithFields(log.Fields{
+			"module":    "system_dedup",
+			"collapsed": collapsed,
+		}).Debug("system_dedup: collapsed task reminders [cpa-task-collapse]")
+	}
+
+	// Re-parse after deletions to find the adjusted keep index.
+	outMsgs := gjson.GetBytes(out, "messages").Array()
+	keepIdx := -1
+	for i, m := range outMsgs {
+		if m.Get("role").String() == "system" &&
+			m.Get("content").Type == gjson.String &&
+			strings.HasPrefix(m.Get("content").String(), taskReminderPrefix) {
+			if m.Get("content").String() == fullContent || keepIdx < 0 {
+				keepIdx = i
+			}
+		}
+	}
+	if keepIdx < 0 {
+		return out
+	}
+
+	keepContent := outMsgs[keepIdx].Get("content").String()
+	preamble, taskList := splitTaskReminder(keepContent)
+	if taskList == "" {
+		// Already split or no task list marker — idempotent, nothing to do.
+		return out
+	}
+
+	// Replace the system reminder content with the stable preamble + anchor.
+	contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
+	var setErr error
+	out, setErr = sjson.SetBytes(out, contentPath, preamble+anchorTag)
+	if setErr != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to set preamble for messages.%d: %v", keepIdx, setErr)
+		return body
+	}
+
+	// Build the user message carrying the variable task list.
+	taskListMsg, err := json.Marshal(map[string]interface{}{
+		"role":    "user",
+		"content": "[task-list]\n" + taskList + "\n[/task-list]",
+	})
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to marshal task-list message: %v", err)
+		return body
+	}
+
+	// Find an existing task-list user message from a previous split
+	// and replace it. Otherwise append at the end.
+	taskListPath := ""
+	replaced := false
+	for i := len(outMsgs) - 1; i >= 0; i-- {
+		r := outMsgs[i].Get("role").String()
+		c := outMsgs[i].Get("content")
+		if r == "user" && c.Type == gjson.String && strings.HasPrefix(c.String(), "[task-list]") {
+			taskListPath = fmt.Sprintf("messages.%d.content", i)
+			replaced = true
+			break
+		}
+	}
+
+	if replaced {
+		raw := gjson.GetBytes(taskListMsg, "content").Raw
+		out, setErr = sjson.SetRawBytes(out, taskListPath, []byte(raw))
+	} else {
+		out, setErr = sjson.SetRawBytes(out, "messages.-1", taskListMsg)
+	}
+	if setErr != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to write task-list message: %v", setErr)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":         "system_dedup",
+		"sys_at":         keepIdx,
+		"list_extracted": len(taskList),
+		"list_replaced":  replaced,
+	}).Debug("system_dedup: split task reminder into system preamble + user task-list [cpa-task-collapse]")
+
+	return out
+}
+
+// splitTaskReminder separates a CC task reminder into its stable preamble
+// and variable task list. Returns the preamble and the extracted task list
+// (without the "Here are the existing tasks:" header). If no task list
+// marker is found, the entire content is returned as preamble and taskList
+// is empty.
+func splitTaskReminder(content string) (preamble, taskList string) {
+	idx := strings.Index(content, taskListMarker)
+	if idx < 0 {
+		return content, ""
+	}
+	preamble = strings.TrimRight(content[:idx], "\n\r")
+	raw := strings.TrimLeft(content[idx+len(taskListMarker):], "\n\r ")
+	if raw == "" {
+		return content, ""
+	}
+	return preamble, raw
+}
+
+// sysNotificationPrefix identifies CC background-task completion notifications
+// injected as role=system. CollapseSystemNotifications uses it for detection.
+const sysNotificationPrefix = "[SYSTEM NOTIFICATION"
+
+// CollapseSystemNotifications collapses multiple CC background-task
+// completion notification system messages into one (the most recent)
+// and normalizes its content to a stable byte form.
+//
+// CC injects a unique system notification for every background command
+// that finishes. Each has different task details (<task-id>, <output-file>,
+// <summary>) and CC occasionally appends a task reminder after the
+// </task-notification> tag. Both forms of variation change the
+// system-prompt block token count and shift the tools section out of
+// KV cache alignment.
+//
+// After collapsing to a single notification, the function strips the
+// <task-notification> XML block and everything after it, replacing them
+// with a fixed placeholder. The model retains the high-attention
+// system-level "background task completed" signal while the specific
+// output (already consumed via tool results) stays visible in the
+// conversation.
+//
+// Logs at debug level when notifications are collapsed or normalized
+// [cpa-task-collapse].
+func CollapseSystemNotifications(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() || len(messages.Array()) < 2 {
+		return body
+	}
+
+	arr := messages.Array()
+	notifIdxs := make([]int, 0)
+
+	for i := range arr {
+		role := arr[i].Get("role").String()
+		if role != "system" {
+			continue
+		}
+		content := arr[i].Get("content")
+		if content.Type == gjson.String && strings.HasPrefix(content.String(), sysNotificationPrefix) {
+			notifIdxs = append(notifIdxs, i)
+		}
+	}
+
+	if len(notifIdxs) == 0 {
+		return body
+	}
+
+	out := body
+
+	// Collapse: keep only the last notification.
+	if len(notifIdxs) > 1 {
+		keepIdx := notifIdxs[len(notifIdxs)-1]
+		removeIdxs := notifIdxs[:len(notifIdxs)-1]
+
+		for _, idx := range removeIdxs {
+			log.WithFields(log.Fields{
+				"module":  "system_dedup",
+				"at":      idx,
+				"keep_at": keepIdx,
+			}).Debug("system_dedup: collapsing stale system notification [cpa-task-collapse]")
+		}
+
+		collapsed := 0
+		for i := len(removeIdxs) - 1; i >= 0; i-- {
+			path := fmt.Sprintf("messages.%d", removeIdxs[i])
+			var err error
+			out, err = sjson.DeleteBytes(out, path)
+			if err != nil {
+				log.WithField("module", "system_dedup").Warnf("task-collapse: failed to delete notification messages.%d: %v", removeIdxs[i], err)
+				return body
+			}
+			collapsed++
+		}
+
+		log.WithFields(log.Fields{
+			"module":    "system_dedup",
+			"collapsed": collapsed,
+		}).Debug("system_dedup: collapsed system notifications [cpa-task-collapse]")
+	}
+
+	// Normalize: strip the variable <task-notification> block from the
+	// surviving notification so every request produces identical tokens.
+	keepIdx := notifIdxs[len(notifIdxs)-1]
+	if len(notifIdxs) > 1 {
+		keepIdx -= len(notifIdxs) - 1
+	}
+
+	keepContent := arr[notifIdxs[len(notifIdxs)-1]].Get("content").String()
+	if normalized := normalizeNotification(keepContent); normalized != keepContent {
+		contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
+		var setErr error
+		out, setErr = sjson.SetBytes(out, contentPath, normalized)
+		if setErr != nil {
+			log.WithField("module", "system_dedup").Warnf("task-collapse: failed to normalize notification messages.%d: %v", keepIdx, setErr)
+			return body
+		}
+
+		log.WithFields(log.Fields{
+			"module":     "system_dedup",
+			"at":         keepIdx,
+			"trimmed_by": len(keepContent) - len(normalized),
+		}).Debug("system_dedup: normalized notification content [cpa-task-collapse]")
+	}
+
+	return out
+}
+
+// notificationPlaceholder replaces the variable per-task XML block inside
+// CC system notifications so the content is byte-stable across requests.
+const notificationPlaceholder = "\n\n[background task completed — output in conversation]"
+
+// normalizeNotification strips the <task-notification> XML block and
+// everything after it from a system notification, replacing the tail
+// with a fixed placeholder. Returns the input unchanged if the marker
+// is not found.
+func normalizeNotification(content string) string {
+	idx := strings.Index(content, "\n<task-notification>")
+	if idx < 0 {
+		return content
+	}
+	return strings.TrimRight(content[:idx], "\n\r") + notificationPlaceholder
+}
+
 // AppendEphemeralSystemMessages moves PreToolUse/PostToolUse hook context
 // system messages to the end of the messages array. These are meta-instructions
 // from CC's hook system injected between tool_result and the next assistant
@@ -617,18 +928,25 @@ func RelocateHookMessages(body []byte) []byte {
 //
 // Anchor rules:
 //   - Hook messages immediately following a tool message are anchored to
-//     that tool's content with a "[hook:...]" label prefix.
-//   - Consecutive hook messages all anchor to the same preceding tool.
-//   - PostToolUseFailure (role=system) may appear farther from its tool;
-//     a look-back of up to 3 messages finds the nearest tool to anchor to.
-//     If no tool is found within that window the message is kept as-is.
-//   - User-role PostToolUse messages have their content extracted from
-//     string or array format, stripped of <system-reminder> wrappers,
-//     and the PostToolUse suffix noise removed via stripPostToolUseSuffix.
-//
-// Hooks already anchored by this function are not re-detected by
-// isPTUSystemMessage / isPostToolUseUserMessage in downstream steps
-// because they become part of the tool message's content string.
+//     that tool's content.
+//   - Consecutive hooks all anchor to the same preceding tool.
+//   - When a normal (non-hook) message sits between a tool and a hook, the
+//     look-back up to 3 positions still finds the tool so the hook can
+//     anchor. An intervening assistant message (model output) resets the
+//     anchor chain because it represents a new reasoning step.
+//   - PostToolUseFailure (role=system) may be farther from its tool; the
+//     look-back handles this. If still no tool is found the message is
+//     kept untouched.
+//   - Hook text is extracted from string or array content, stripped of
+//     <system-reminder> wrappers. For PreToolUse messages that embed a
+//     PostToolUse suffix the suffix is trimmed (stripPostToolUseSuffix);
+//     standalone PostToolUse messages are anchored in full — including
+//     per-round counters — so the model sees accurate operation scope.
+//   - When the hook text cannot be reliably extracted (e.g. array content
+//     with no matching text element) the message is skipped and kept as-is
+//     in the conversation.
+//   - Tool content that is an array has the hook text appended as a new
+//     {"type":"text","text":"..."} element rather than being stringified.
 //
 // Logs at debug level when hooks are anchored [cpa-reanchor].
 func ReanchorHooks(body []byte) []byte {
@@ -659,8 +977,14 @@ func ReanchorHooks(body []byte) []byte {
 				anchors[i] = anchor{toolIdx: lastToolIdx}
 			} else {
 				// Look back for a tool message up to 3 positions.
+				// An intervening assistant message (model output) breaks
+				// the search — hooks belong to the current reasoning step.
 				for j := i - 1; j >= 0 && j >= i-3; j-- {
-					if arr[j].Get("role").String() == "tool" {
+					rj := arr[j].Get("role").String()
+					if rj == "assistant" {
+						break
+					}
+					if rj == "tool" {
 						lastToolIdx = j
 						break
 					}
@@ -672,10 +996,11 @@ func ReanchorHooks(body []byte) []byte {
 			continue
 		}
 
-		// Non-tool, non-hook message resets the anchor chain.
-		// PTU/PostToolUse only anchor to the immediately preceding tool;
-		// an intervening assistant/user breaks the chain.
-		if !isHookForReanchor(arr[i]) {
+		// Only assistant messages (model output) reset the anchor chain.
+		// User/system messages that are not hooks are transparent — a hook
+		// arriving after them can still anchor to the preceding tool via
+		// the look-back window.
+		if role == "assistant" {
 			lastToolIdx = -1
 		}
 	}
@@ -684,31 +1009,24 @@ func ReanchorHooks(body []byte) []byte {
 		return body
 	}
 
-	// Pass 2: build anchored tool content strings.
-	// Group hook indices by their anchor tool index.
-	toolHooks := make(map[int][]int)
+	// Pass 2: extract hook text and group by anchor tool.
+	toolHooks := make(map[int][]string)
+	skipped := 0
 	for hookIdx, a := range anchors {
-		toolHooks[a.toolIdx] = append(toolHooks[a.toolIdx], hookIdx)
-	}
-
-	// Build updated tool content for each anchored tool.
-	toolReplacements := make(map[int]string)
-	for toolIdx, hookIdxs := range toolHooks {
-		origContent := arr[toolIdx].Get("content").String()
-		var sb strings.Builder
-		sb.WriteString(origContent)
-		for _, hi := range hookIdxs {
-			hookLabel, hookText := extractHookForReanchor(arr[hi])
-			sb.WriteString("\n\n[hook:")
-			sb.WriteString(hookLabel)
-			sb.WriteString("] ")
-			sb.WriteString(hookText)
+		ht, ok := extractHookForReanchor(arr[hookIdx])
+		if !ok {
+			delete(anchors, hookIdx)
+			skipped++
+			continue
 		}
-		toolReplacements[toolIdx] = sb.String()
+		toolHooks[a.toolIdx] = append(toolHooks[a.toolIdx], ht)
 	}
 
-	// Pass 3: rebuild messages array, applying tool content replacements
-	// and skipping anchored hook messages.
+	if len(anchors) == 0 {
+		return body
+	}
+
+	// Pass 3: rebuild messages array.
 	var buf bytes.Buffer
 	buf.WriteByte('[')
 	first := true
@@ -718,26 +1036,27 @@ func ReanchorHooks(body []byte) []byte {
 			continue
 		}
 
-		if repl, ok := toolReplacements[i]; ok {
-			// Replace this tool message's content string.
-			updated, err := sjson.SetBytes([]byte(arr[i].Raw), "content", repl)
-			if err != nil {
-				log.WithField("module", "system_dedup").Warnf("reanchor: failed to set tool content at %d: %v", i, err)
-				updated = []byte(arr[i].Raw)
-			}
+		hts, hasHooks := toolHooks[i]
+		if !hasHooks {
 			if !first {
 				buf.WriteByte(',')
 			}
 			first = false
-			buf.Write(updated)
+			buf.WriteString(arr[i].Raw)
 			continue
 		}
 
+		// This tool message has hooks to anchor — build updated content.
+		updated, err := buildAnchoredToolMessage([]byte(arr[i].Raw), hts)
+		if err != nil {
+			log.WithField("module", "system_dedup").Warnf("reanchor: failed to build anchored tool at %d: %v", i, err)
+			updated = []byte(arr[i].Raw)
+		}
 		if !first {
 			buf.WriteByte(',')
 		}
 		first = false
-		buf.WriteString(arr[i].Raw)
+		buf.Write(updated)
 	}
 	buf.WriteByte(']')
 
@@ -747,12 +1066,45 @@ func ReanchorHooks(body []byte) []byte {
 		return body
 	}
 
-	log.WithFields(log.Fields{
+	fields := log.Fields{
 		"module":   "system_dedup",
 		"anchored": len(anchors),
-	}).Debug("system_dedup: anchored hook messages into tool content [cpa-reanchor]")
+	}
+	if skipped > 0 {
+		fields["skipped"] = skipped
+	}
+	log.WithFields(fields).Debug("system_dedup: anchored hook messages into tool content [cpa-reanchor]")
 
 	return result
+}
+
+// buildAnchoredToolMessage appends hook texts into the content of a tool
+// message. If the original content is a string the hook texts are appended
+// with a "\n\n---\n" separator. If it is an array a new text element is
+// appended to the array.
+func buildAnchoredToolMessage(toolRaw []byte, hooks []string) ([]byte, error) {
+	content := gjson.GetBytes(toolRaw, "content")
+
+	var merged string
+	for i, h := range hooks {
+		if i > 0 {
+			merged += "\n"
+		}
+		merged += h
+	}
+
+	if content.IsArray() {
+		// Append as a new {"type":"text","text":"..."} element.
+		elem := json.RawMessage(`{"type":"text","text":""}`)
+		quoted, _ := json.Marshal(merged)
+		elem, _ = sjson.SetRawBytes(elem, "text", quoted)
+		return sjson.SetRawBytes(toolRaw, "content.-1", elem)
+	}
+
+	// String content — append with separator.
+	orig := content.String()
+	orig += "\n\n---\n" + merged
+	return sjson.SetBytes(toolRaw, "content", orig)
 }
 
 // isHookForReanchor reports whether a message is a hook that should be
@@ -769,13 +1121,20 @@ func isHookForReanchor(m gjson.Result) bool {
 	return false
 }
 
-// extractHookForReanchor extracts a human-readable label and the cleaned
-// hook text from a hook message. The label is the hook type prefix
-// (e.g. "PreToolUse:Read", "PostToolUseFailure:mcp__..."). The text is
-// stripped of <system-reminder> wrappers and PostToolUse suffix noise.
-func extractHookForReanchor(m gjson.Result) (label, text string) {
+// extractHookForReanchor extracts the cleaned hook text from a hook
+// message. Returns (text, true) on success; (_, false) when the hook
+// content cannot be reliably extracted and the message should be left
+// untouched.
+//
+// For PreToolUse messages (role=system, content starts with "PreToolUse:")
+// the embedded PostToolUse suffix is trimmed via stripPostToolUseSuffix.
+// For standalone PostToolUse/PostToolUseFailure messages the full text is
+// kept, including per-round counters, so the model sees accurate operation
+// scope.
+func extractHookForReanchor(m gjson.Result) (text string, ok bool) {
 	content := m.Get("content")
 	var raw string
+
 	if content.Type == gjson.String {
 		raw = content.String()
 	} else if content.IsArray() {
@@ -791,13 +1150,14 @@ func extractHookForReanchor(m gjson.Result) (label, text string) {
 			}
 		}
 		if raw == "" {
-			raw = content.Raw
+			return "", false // array with no recognisable hook text element
 		}
 	} else {
-		raw = content.Raw
+		return "", false // unexpected content type
 	}
 
 	raw = strings.TrimSpace(raw)
+
 	// Strip <system-reminder> wrapper if present.
 	if strings.HasPrefix(raw, "<system-reminder>") {
 		idx := strings.Index(raw, ">")
@@ -811,38 +1171,14 @@ func extractHookForReanchor(m gjson.Result) (label, text string) {
 		raw = strings.TrimSpace(raw)
 	}
 
-	// Extract label from the hook prefix.
-	label = extractHookLabel(raw)
-
-	// Remove PostToolUse suffix noise for stable dedup anchors.
-	cleaned := stripPostToolUseSuffix(raw)
-	return label, cleaned
-}
-
-// extractHookLabel extracts the hook type identifier from the hook text
-// prefix, e.g. "PreToolUse:Bash" or "PostToolUseFailure:mcp__chrome".
-func extractHookLabel(text string) string {
-	text = strings.TrimSpace(text)
-	for _, prefix := range []string{"PreToolUse:", "PostToolUseFailure:", "PostToolUse:"} {
-		if strings.HasPrefix(text, prefix) {
-			rest := text[len(prefix):]
-			// Take up to the first space or colon for the tool name.
-			end := strings.IndexAny(rest, " \t\n:(")
-			if end < 0 {
-				end = len(rest)
-			}
-			toolName := rest[:end]
-			if toolName == "" {
-				return prefix[:len(prefix)-1] // "PreToolUse", "PostToolUse", etc.
-			}
-			return prefix + toolName
-		}
+	// For PTU messages that embed a PostToolUse suffix: strip the suffix
+	// so only the PreToolUse instruction anchors. The standalone PostToolUse
+	// messages carry the counter info.
+	if strings.HasPrefix(raw, "PreToolUse:") {
+		raw = stripPostToolUseSuffix(raw)
 	}
-	// Fallback: first 40 chars.
-	if len(text) > 40 {
-		return text[:40]
-	}
-	return text
+
+	return raw, true
 }
 
 // ReorderSystemMessagesToFront moves all system-role messages to the

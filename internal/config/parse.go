@@ -102,6 +102,10 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		fals := false
 		cfg.CPAPipeline.EnableHookReanchor = &fals
 	}
+	if cfg.CPAPipeline.EnableReorderJSON == nil {
+		fals := false
+		cfg.CPAPipeline.EnableReorderJSON = &fals
+	}
 
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()

@@ -138,3 +138,171 @@ func TestToolsort_AlreadySorted(t *testing.T) {
 		t.Fatalf("already sorted should not change: got %s", string(out))
 	}
 }
+
+// --- ReorderJSONForCache tests ---
+
+func TestReorder_Basic(t *testing.T) {
+	body := []byte(`{"stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"test"}}],"model":"deepseek-v4-flash","stream_options":{"include_usage":true},"reasoning_effort":"xhigh"}`)
+	out := ReorderJSONForCache(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	outStr := string(out)
+	// Verify order: model first, tools before messages, messages last among known keys
+	modelIdx := bytes.Index(out, []byte(`"model"`))
+	toolsIdx := bytes.Index(out, []byte(`"tools"`))
+	msgsIdx := bytes.Index(out, []byte(`"messages"`))
+	streamIdx := bytes.Index(out, []byte(`"stream"`))
+	if modelIdx < 0 || toolsIdx < 0 || msgsIdx < 0 {
+		t.Fatalf("missing expected keys: %s", outStr)
+	}
+	if modelIdx > toolsIdx {
+		t.Fatalf("model should be before tools: %s", outStr)
+	}
+	if toolsIdx > msgsIdx {
+		t.Fatalf("tools should be before messages: %s", outStr)
+	}
+	if streamIdx > msgsIdx {
+		t.Fatalf("stream* should be before messages: %s", outStr)
+	}
+}
+
+func TestReorder_MessagesLast(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"}],"model":"test"}`)
+	out := ReorderJSONForCache(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	outStr := string(out)
+	modelIdx := bytes.Index(out, []byte(`"model"`))
+	msgsIdx := bytes.Index(out, []byte(`"messages"`))
+	if modelIdx > msgsIdx {
+		t.Fatalf("messages must be last among known keys: %s", outStr)
+	}
+}
+
+func TestReorder_NoTools(t *testing.T) {
+	body := []byte(`{"model":"test","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	out := ReorderJSONForCache(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	outStr := string(out)
+	// messages must still be last among known keys
+	modelIdx := bytes.Index(out, []byte(`"model"`))
+	msgsIdx := bytes.Index(out, []byte(`"messages"`))
+	if modelIdx > msgsIdx {
+		t.Fatalf("messages must be last: %s", outStr)
+	}
+}
+
+func TestReorder_NoMessages(t *testing.T) {
+	// count_tokens requests may have no messages key
+	body := []byte(`{"model":"deepseek-v4-flash"}`)
+	out := ReorderJSONForCache(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+}
+
+func TestReorder_UnknownKeysAfterMessages(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}],"model":"test","custom_field":"value","another":123}`)
+	out := ReorderJSONForCache(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	outStr := string(out)
+	msgsIdx := bytes.Index(out, []byte(`"messages"`))
+	customIdx := bytes.Index(out, []byte(`"custom_field"`))
+	anotherIdx := bytes.Index(out, []byte(`"another"`))
+	if msgsIdx > customIdx || msgsIdx > anotherIdx {
+		t.Fatalf("unknown keys must come after messages: %s", outStr)
+	}
+}
+
+func TestReorder_Idempotent(t *testing.T) {
+	body := []byte(`{"stream":true,"model":"test","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"f"}}]}`)
+	out1 := ReorderJSONForCache(body)
+	out2 := ReorderJSONForCache(out1)
+	if string(out1) != string(out2) {
+		t.Fatalf("must be idempotent:\n  %s\n  %s", string(out1), string(out2))
+	}
+}
+
+func TestReorder_PreservesContent(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"system","content":[{"type":"text","text":"You are Claude."}]},{"role":"user","content":"hello"},{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{}"}}]}],"tools":[{"type":"function","function":{"name":"Bash","description":"Execute a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}}],"stream":true,"reasoning_effort":"xhigh"}`)
+	out := ReorderJSONForCache(body)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	if !bytes.Contains(out, []byte(`"deepseek-v4-flash"`)) {
+		t.Fatalf("model name lost")
+	}
+	if !bytes.Contains(out, []byte(`"You are Claude."`)) {
+		t.Fatalf("system prompt lost")
+	}
+	if !bytes.Contains(out, []byte(`"Bash"`)) {
+		t.Fatalf("tool name lost")
+	}
+	if !bytes.Contains(out, []byte(`"Execute a shell command"`)) {
+		t.Fatalf("tool description lost")
+	}
+	if !bytes.Contains(out, []byte(`"xhigh"`)) {
+		t.Fatalf("reasoning_effort lost")
+	}
+	if !bytes.Contains(out, []byte(`"tool_calls"`)) {
+		t.Fatalf("assistant tool_calls lost")
+	}
+}
+
+func TestReorder_InvalidJSONFallback(t *testing.T) {
+	body := []byte(`{invalid}`)
+	out := ReorderJSONForCache(body)
+	if string(out) != string(body) {
+		t.Fatalf("invalid JSON must be returned unchanged, got %s", string(out))
+	}
+}
+
+func TestReorder_EmptyBody(t *testing.T) {
+	body := []byte(``)
+	out := ReorderJSONForCache(body)
+	if string(out) != string(body) {
+		t.Fatalf("empty body must be returned unchanged, got %s", string(out))
+	}
+}
+
+func TestReorder_WithSortTools(t *testing.T) {
+	// Verify SortToolsByName + ReorderJSONForCache work together
+	body := []byte(`{"model":"test","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"z"}},{"type":"function","function":{"name":"a"}}]}`)
+	sorted := SortToolsByName(body)
+	out := ReorderJSONForCache(sorted)
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+	outStr := string(out)
+	// tools should be before messages
+	toolsIdx := bytes.Index(out, []byte(`"tools"`))
+	msgsIdx := bytes.Index(out, []byte(`"messages"`))
+	if toolsIdx > msgsIdx {
+		t.Fatalf("tools must come before messages: %s", outStr)
+	}
+	// tools should be sorted: a before z
+	aIdx := bytes.Index(out, []byte(`"a"`))
+	zIdx := bytes.Index(out, []byte(`"z"`))
+	if aIdx < 0 || zIdx < 0 {
+		t.Fatalf("tool names missing: %s", outStr)
+	}
+	if aIdx > zIdx {
+		t.Fatalf("tools must be sorted alphabetically: %s", outStr)
+	}
+}
+
+func TestReorder_DeterministicAcrossEquivalentInputs(t *testing.T) {
+	a := []byte(`{"messages":[{"role":"user","content":"hi"}],"model":"test","tools":[{"type":"function","function":{"name":"f"}}],"stream":true}`)
+	b := []byte(`{"stream":true,"tools":[{"function":{"name":"f"},"type":"function"}],"model":"test","messages":[{"content":"hi","role":"user"}]}`)
+	outA := ReorderJSONForCache(a)
+	outB := ReorderJSONForCache(b)
+	if string(outA) != string(outB) {
+		t.Fatalf("semantically equivalent inputs must produce identical output:\n  A: %s\n  B: %s", string(outA), string(outB))
+	}
+}

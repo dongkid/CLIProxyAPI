@@ -80,6 +80,13 @@ cpa-cache:
   # for upstream KV cache affinity.
   # enable-canonicalize: true
 
+  # [cpa-task-collapse] Collapse multiple Claude Code task reminder
+  # system messages into a single message (the most recent one).
+  # Prevents indefinite system message count growth from CC's periodic
+  # task reminders, which would otherwise cause DeepSeek's chat template
+  # to shift all downstream token positions and break KV cache.
+  # enable-task-collapse: true
+
 # When true, write application logs to rotating files instead of stdout
 logging-to-file: false
 

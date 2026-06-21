@@ -200,6 +200,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
 		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
+			translated = helps.CollapseSystemNotifications(translated) // [cpa-task-collapse]
+			translated = helps.CollapseTaskReminders(translated)       // [cpa-task-collapse]
+		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
 			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
 		}
@@ -209,7 +213,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
 			translated = helps.SortToolsByName(translated) // [cpa-toolsort]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableReorderJSON) {
+			translated = helps.ReorderJSONForCache(translated) // [cpa-reorder-json]
+		} else if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
 			translated = helps.CanonicalizeJSON(translated) // [cpa-canon]
 		}
 	}
@@ -230,21 +236,21 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
-	if headerName := e.sessionAffinityHeaderName(); headerName != "" {
-		if sid := cliproxyauth.ExtractSessionID(opts.Headers, req.Payload, opts.Metadata); sid != "" {
-			// The official OpenCode CLI uses two mutually-exclusive header sets
-			// depending on the provider type. For OpenCode providers, send the
-			// x-opencode-* set; for all others, forward the configured header.
-			if e.isOpenCodeProvider() {
-				goSessionID := helps.OpenCodeSessionID(sid)
-				httpReq.Header.Set("x-opencode-session", goSessionID)
-				httpReq.Header.Set("x-opencode-client", "cpa")
-				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding x-opencode-session=%s", cliproxyauth.TruncateSessionID(goSessionID))
-			} else {
-				httpReq.Header.Set(headerName, sid)
-				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding %s=%s", headerName, cliproxyauth.TruncateSessionID(sid))
-			}
-		} else {
+	sid := cliproxyauth.ExtractSessionID(opts.Headers, req.Payload, opts.Metadata)
+	if sid != "" {
+		if e.isOpenCodeProvider() {
+			goSessionID := helps.OpenCodeSessionID(sid)
+			httpReq.Header.Set("x-opencode-session", goSessionID)
+			httpReq.Header.Set("x-opencode-client", "cpa")
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding x-opencode-session=%s", cliproxyauth.TruncateSessionID(goSessionID))
+		} else if headerName := e.sessionAffinityHeaderName(); headerName != "" {
+			httpReq.Header.Set(headerName, sid)
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding %s=%s", headerName, cliproxyauth.TruncateSessionID(sid))
+		}
+	} else {
+		if e.isOpenCodeProvider() {
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: opencode provider but no session ID extracted")
+		} else if headerName := e.sessionAffinityHeaderName(); headerName != "" {
 			helps.LogWithRequestID(ctx).Debugf("session-affinity: header %s configured but no session ID extracted", headerName)
 		}
 	}
@@ -448,6 +454,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
 		}
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
+			translated = helps.CollapseSystemNotifications(translated) // [cpa-task-collapse]
+			translated = helps.CollapseTaskReminders(translated)       // [cpa-task-collapse]
+		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
 			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
 		}
@@ -457,7 +467,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
 			translated = helps.SortToolsByName(translated) // [cpa-toolsort]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
+		if e.isCPAStepEnabled(e.cpaPipeline().EnableReorderJSON) {
+			translated = helps.ReorderJSONForCache(translated) // [cpa-reorder-json]
+		} else if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
 			translated = helps.CanonicalizeJSON(translated) // [cpa-canon]
 		}
 	}
@@ -472,21 +484,21 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
-	if headerName := e.sessionAffinityHeaderName(); headerName != "" {
-		if sid := cliproxyauth.ExtractSessionID(opts.Headers, req.Payload, opts.Metadata); sid != "" {
-			// The official OpenCode CLI uses two mutually-exclusive header sets
-			// depending on the provider type. For OpenCode providers, send the
-			// x-opencode-* set; for all others, forward the configured header.
-			if e.isOpenCodeProvider() {
-				goSessionID := helps.OpenCodeSessionID(sid)
-				httpReq.Header.Set("x-opencode-session", goSessionID)
-				httpReq.Header.Set("x-opencode-client", "cpa")
-				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding x-opencode-session=%s", cliproxyauth.TruncateSessionID(goSessionID))
-			} else {
-				httpReq.Header.Set(headerName, sid)
-				helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding %s=%s", headerName, cliproxyauth.TruncateSessionID(sid))
-			}
-		} else {
+	sid := cliproxyauth.ExtractSessionID(opts.Headers, req.Payload, opts.Metadata)
+	if sid != "" {
+		if e.isOpenCodeProvider() {
+			goSessionID := helps.OpenCodeSessionID(sid)
+			httpReq.Header.Set("x-opencode-session", goSessionID)
+			httpReq.Header.Set("x-opencode-client", "cpa")
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding x-opencode-session=%s", cliproxyauth.TruncateSessionID(goSessionID))
+		} else if headerName := e.sessionAffinityHeaderName(); headerName != "" {
+			httpReq.Header.Set(headerName, sid)
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: forwarding %s=%s", headerName, cliproxyauth.TruncateSessionID(sid))
+		}
+	} else {
+		if e.isOpenCodeProvider() {
+			helps.LogWithRequestID(ctx).Debugf("session-affinity: opencode provider but no session ID extracted")
+		} else if headerName := e.sessionAffinityHeaderName(); headerName != "" {
 			helps.LogWithRequestID(ctx).Debugf("session-affinity: header %s configured but no session ID extracted", headerName)
 		}
 	}

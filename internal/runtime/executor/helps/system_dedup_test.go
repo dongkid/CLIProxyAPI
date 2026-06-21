@@ -167,6 +167,394 @@ func TestDedup_ScatteredDuplicates(t *testing.T) {
 	}
 }
 
+// --- CollapseTaskReminders tests ---
+
+func TestCollapseTask_NoMessages(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4-pro"}`)
+	out := CollapseTaskReminders(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestCollapseTask_NoTaskReminders(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"hi"}]}`)
+	out := CollapseTaskReminders(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestCollapseTask_SingleTaskReminder(t *testing.T) {
+	// Single reminder → preamble stays system, task list extracted to new user message
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks, consider using TaskCreate.\n\nHere are the existing tasks:\n\n#1. [in_progress] Do thing"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 3 {
+		t.Fatalf("expected 3 messages (sys_prompt + system_preamble + user_tasklist), got %d: %s", count, string(out))
+	}
+	// System message should have anchor tag, NOT the task list
+	sysContent := gjson.GetBytes(out, "messages.1.content").String()
+	if !strings.Contains(sysContent, "current task list follows") {
+		t.Fatalf("system preamble should have anchor tag, got: %s", sysContent)
+	}
+	if strings.Contains(sysContent, "Do thing") {
+		t.Fatalf("system preamble should NOT contain task list, got: %s", sysContent)
+	}
+	// User message should have the task list
+	userContent := gjson.GetBytes(out, "messages.2.content").String()
+	if !strings.Contains(userContent, "[task-list]") || !strings.Contains(userContent, "Do thing") {
+		t.Fatalf("user message should contain task list, got: %s", userContent)
+	}
+}
+
+func TestCollapseTask_MultipleTaskReminders(t *testing.T) {
+	// Two variants → collapsed to 1, task list extracted to user message
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"start"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A"},{"role":"assistant","content":"ok"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A\n#2. [in_progress] Task B"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	}
+	// Second reminder (at index 3 after collapse) should be system with preamble
+	sysContent := gjson.GetBytes(out, "messages.3.content").String()
+	if strings.Contains(sysContent, "Task B") {
+		t.Fatalf("system preamble should NOT contain task list, got: %s", sysContent)
+	}
+	if !strings.Contains(sysContent, "current task list follows") {
+		t.Fatalf("system preamble should have anchor tag, got: %s", sysContent)
+	}
+	// User message at end should have most complete task list
+	userContent := gjson.GetBytes(out, "messages.4.content").String()
+	if !strings.Contains(userContent, "Task B") {
+		t.Fatalf("user message should contain most complete task list, got: %s", userContent)
+	}
+	if !strings.Contains(userContent, "[task-list]") || !strings.Contains(userContent, "[/task-list]") {
+		t.Fatalf("user message should be wrapped in [task-list] tags, got: %s", userContent)
+	}
+}
+
+func TestCollapseTask_OnlyTaskReminders(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B\n#3. Task C"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages (sys_preamble + user_tasklist), got %d: %s", count, string(out))
+	}
+	sysContent := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.Contains(sysContent, "current task list follows") {
+		t.Fatalf("system should have anchor tag, got: %s", sysContent)
+	}
+	if strings.Contains(sysContent, "Task C") {
+		t.Fatalf("system preamble should NOT contain task list, got: %s", sysContent)
+	}
+	userContent := gjson.GetBytes(out, "messages.1.content").String()
+	if !strings.Contains(userContent, "Task C") {
+		t.Fatalf("user message should have most complete task list, got: %s", userContent)
+	}
+}
+
+func TestCollapseTask_MixedWithNormalMessages(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"q1"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"assistant","content":"a1"},{"role":"tool","content":"t1"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"},{"role":"user","content":"q2"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 7 {
+		t.Fatalf("expected 7 messages, got %d: %s", count, string(out))
+	}
+	// Find the system reminder — should have anchor, not task list
+	var sysFound, userFound bool
+	for i := 0; i < int(count); i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
+			sysFound = true
+			if strings.Contains(c, "Task A") {
+				t.Fatalf("system preamble should NOT contain task list, got: %s", c)
+			}
+		}
+		if r == "user" && strings.Contains(c, "[task-list]") {
+			userFound = true
+			if !strings.Contains(c, "Task B") {
+				t.Fatalf("user task-list should have most complete version, got: %s", c)
+			}
+		}
+	}
+	if !sysFound {
+		t.Fatal("system reminder with preamble not found")
+	}
+	if !userFound {
+		t.Fatal("user task-list message not found")
+	}
+}
+
+func TestCollapseTask_ArrayContentNotCollapsed(t *testing.T) {
+	// System messages with array content should not be collapsed (not string content)
+	body := []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"The task tools haven't been used recently. This will not match."}]},{"role":"user","content":"hi"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages (array content not matched), got %d: %s", count, string(out))
+	}
+}
+
+func TestCollapseTask_DedupThenCollapse(t *testing.T) {
+	// dedup removes exact copies, collapse splits preamble+task-list
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"user","content":"hi"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"}]}`)
+	out := DeduplicateSystemMessages(body)
+	out = CollapseTaskReminders(out)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 4 {
+		t.Fatalf("expected 4 messages (sys_prompt + sys_preamble + user_hi + user_tasklist), got %d: %s", count, string(out))
+	}
+	// Find system preamble and user task-list
+	var sysOk, userOk bool
+	for i := 0; i < int(count); i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
+			sysOk = true
+			if strings.Contains(c, "Task B") {
+				t.Fatalf("system preamble should NOT contain task list, got: %s", c)
+			}
+			if !strings.Contains(c, "current task list follows") {
+				t.Fatalf("system preamble should have anchor tag, got: %s", c)
+			}
+		}
+		if r == "user" && strings.Contains(c, "[task-list]") {
+			userOk = true
+			if !strings.Contains(c, "Task B") {
+				t.Fatalf("user task-list should have most complete version, got: %s", c)
+			}
+		}
+	}
+	if !sysOk {
+		t.Fatal("system preamble with anchor not found")
+	}
+	if !userOk {
+		t.Fatal("user task-list message not found")
+	}
+}
+
+func TestCollapseTask_SplitReminder(t *testing.T) {
+	// Single reminder → preamble stays system, task list extracted to user
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"hi"},{"role":"system","content":"The task tools haven't been used recently. If you are working on tasks, consider using TaskCreate.\n\nHere are the existing tasks:\n\n#1. [in_progress] Some task\n#2. [pending] Another"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	}
+	sysContent := gjson.GetBytes(out, "messages.2.content").String()
+	if !strings.Contains(sysContent, "current task list follows") {
+		t.Fatalf("system should have anchor, got: %s", sysContent)
+	}
+	userContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(userContent, "Some task") || !strings.Contains(userContent, "Another") {
+		t.Fatalf("user message should contain complete task list, got: %s", userContent)
+	}
+}
+
+func TestCollapseTask_NoTaskListMarker(t *testing.T) {
+	// Reminder without task list marker → splitTaskReminder returns empty taskList → body unchanged
+	body := []byte(`{"messages":[{"role":"system","content":"The task tools haven't been used recently. Just a plain reminder."},{"role":"user","content":"hi"}]}`)
+	out := CollapseTaskReminders(body)
+	// Since no task list marker: splitTaskReminder returns taskList="", function returns out unchanged
+	// (the msg stays as-is because there's nothing to extract)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages (unchanged), got %d: %s", count, string(out))
+	}
+}
+
+func TestCollapseTask_IdempotentSplit(t *testing.T) {
+	// Running collapse twice must produce identical results (no duplicate task-list messages)
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A"}]}`)
+	out1 := CollapseTaskReminders(body)
+	out2 := CollapseTaskReminders(out1)
+	c1 := gjson.GetBytes(out1, "messages.#").Int()
+	c2 := gjson.GetBytes(out2, "messages.#").Int()
+	if c1 != c2 {
+		t.Fatalf("idempotent: first pass=%d messages, second pass=%d messages (should be equal)", c1, c2)
+	}
+	if string(out1) != string(out2) {
+		t.Fatalf("idempotent: bodies differ\npass1: %s\npass2: %s", string(out1), string(out2))
+	}
+}
+
+func TestCollapseTask_ReplaceExistingTaskList(t *testing.T) {
+	// Simulate two consecutive requests where the task list changes
+	// Request 1: Task A
+	body1 := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A"}]}`)
+	_ = CollapseTaskReminders(body1) // first split: produces preamble + task-list user msg
+
+	// Request 2 builds on out1 (history + new messages from CC)
+	// CC injects a new task reminder with Task A + Task B
+	body2 := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Task A\n#2. [in_progress] Task B"},{"role":"user","content":"Continue working."}]}`)
+	out2 := CollapseTaskReminders(body2)
+
+	// After both passes, there should be exactly 1 task-list user message
+	taskListCount := 0
+	for i := 0; i < int(gjson.GetBytes(out2, "messages.#").Int()); i++ {
+		r := gjson.GetBytes(out2, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out2, fmt.Sprintf("messages.%d.content", i)).String()
+		if r == "user" && strings.HasPrefix(c, "[task-list]") {
+			taskListCount++
+			if !strings.Contains(c, "Task B") || !strings.Contains(c, "completed") {
+				t.Fatalf("task list should reflect latest state (Task A completed, Task B in_progress), got: %s", c)
+			}
+		}
+	}
+	if taskListCount != 1 {
+		t.Fatalf("expected exactly 1 task-list user message, got %d: %s", taskListCount, string(out2))
+	}
+}
+
+// --- CollapseSystemNotifications tests ---
+
+func TestCollapseNotif_NoMessages(t *testing.T) {
+	body := []byte(`{"model":"deepseek"}`)
+	out := CollapseSystemNotifications(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestCollapseNotif_NoNotifications(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"hi"}]}`)
+	out := CollapseSystemNotifications(body)
+	if string(out) != string(body) {
+		t.Fatalf("expected no change, got %s", string(out))
+	}
+}
+
+func TestCollapseNotif_SingleNotification(t *testing.T) {
+	// Single notification → normalized (XML block stripped)
+	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event.\n\n<task-notification>\n<task-id>abc</task-id>\n<output-file>/tmp/x</output-file>\n</task-notification>"}]}`)
+	out := CollapseSystemNotifications(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
+	}
+	kept := gjson.GetBytes(out, "messages.1.content").String()
+	if strings.Contains(kept, "<task-notification>") || strings.Contains(kept, "<task-id>") {
+		t.Fatalf("XML block should have been stripped, got: %s", kept)
+	}
+	if !strings.Contains(kept, "background task completed") {
+		t.Fatalf("normalized notification should have placeholder, got: %s", kept)
+	}
+}
+
+func TestCollapseNotif_MultipleNotifications(t *testing.T) {
+	// Multiple → collapsed to 1, then normalized
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"start"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"assistant","content":"ok"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>b</task-id>\n</task-notification>"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>c</task-id>\n</task-notification>"}]}`)
+	out := CollapseSystemNotifications(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	}
+	notifCount := 0
+	for i := 0; i < int(count); i++ {
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if strings.HasPrefix(c, sysNotificationPrefix) {
+			notifCount++
+			if strings.Contains(c, "<task-notification>") {
+				t.Fatalf("XML block should be stripped, got: %s", c)
+			}
+		}
+	}
+	if notifCount != 1 {
+		t.Fatalf("expected 1 notification, got %d", notifCount)
+	}
+}
+
+func TestCollapseNotif_OnlyNotifications(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>1</task-id>\n</task-notification>TASK_REMINDER_TAIL"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>2</task-id>\n</task-notification>MORE_TAIL"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>3</task-id>\n</task-notification>STUFF"}]}`)
+	out := CollapseSystemNotifications(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 1 {
+		t.Fatalf("expected 1 message, got %d: %s", count, string(out))
+	}
+	kept := gjson.GetBytes(out, "messages.0.content").String()
+	if strings.Contains(kept, "STUFF") || strings.Contains(kept, "TASK_REMINDER_TAIL") {
+		t.Fatalf("tail after XML should be stripped, got: %s", kept)
+	}
+	if !strings.Contains(kept, "background task completed") {
+		t.Fatalf("should have placeholder, got: %s", kept)
+	}
+}
+
+func TestCollapseNotif_Idempotent(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>b</task-id>\n</task-notification>tail"},{"role":"user","content":"hi"}]}`)
+	out1 := CollapseSystemNotifications(body)
+	out2 := CollapseSystemNotifications(out1)
+	c1 := gjson.GetBytes(out1, "messages.#").Int()
+	c2 := gjson.GetBytes(out2, "messages.#").Int()
+	if c1 != c2 {
+		t.Fatalf("idempotent: first pass=%d messages, second pass=%d", c1, c2)
+	}
+	if string(out1) != string(out2) {
+		t.Fatalf("idempotent: bodies differ\npass1: %s\npass2: %s", string(out1), string(out2))
+	}
+	// Verify 1 notification, normalized
+	notifCount := 0
+	for i := 0; i < int(c1); i++ {
+		c := gjson.GetBytes(out1, fmt.Sprintf("messages.%d.content", i)).String()
+		if strings.HasPrefix(c, sysNotificationPrefix) {
+			notifCount++
+			if strings.Contains(c, "<task-notification>") || strings.Contains(c, "tail") {
+				t.Fatalf("notification should be normalized, got: %s", c)
+			}
+		}
+	}
+	if notifCount != 1 {
+		t.Fatalf("expected 1 notification, got %d", notifCount)
+	}
+}
+
+func TestCollapseNotif_WithTaskReminders(t *testing.T) {
+	// New pipeline order: notification normalization runs FIRST,
+	// cleaning embedded task reminders before CollapseTaskReminders sees them.
+	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Do thing"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>\n\nThe task tools haven't been used recently. EMBEDDED REMINDER"},{"role":"user","content":"u1"}]}`)
+	// New order: notif collapse first, then task collapse
+	out := CollapseSystemNotifications(body)
+	out = CollapseTaskReminders(out)
+
+	count := gjson.GetBytes(out, "messages.#").Int()
+	notifCount := 0
+	taskPreambleCount := 0
+	for i := 0; i < int(count); i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if strings.HasPrefix(c, sysNotificationPrefix) {
+			notifCount++
+			if strings.Contains(c, "EMBEDDED REMINDER") || strings.Contains(c, "<task-notification>") {
+				t.Fatalf("notification should be normalized (embedded reminder stripped), got: %s", c)
+			}
+		}
+		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
+			taskPreambleCount++
+			if strings.Contains(c, "Here are the existing tasks") {
+				t.Fatalf("task preamble should NOT contain task list marker, got: %s", c)
+			}
+		}
+	}
+	if notifCount != 1 {
+		t.Fatalf("expected 1 notification, got %d", notifCount)
+	}
+	if taskPreambleCount != 1 {
+		t.Fatalf("expected 1 task preamble, got %d", taskPreambleCount)
+	}
+}
+
+func TestCollapseNotif_NoMarker(t *testing.T) {
+	// Notification without <task-notification> marker → unchanged
+	body := []byte(`{"messages":[{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification."},{"role":"user","content":"hi"}]}`)
+	out := CollapseSystemNotifications(body)
+	kept := gjson.GetBytes(out, "messages.0.content").String()
+	if kept != "[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification." {
+		t.Fatalf("without marker, content should be unchanged, got: %s", kept)
+	}
+}
+
 // --- AppendEphemeralSystemMessages tests ---
 
 func TestEph_NoEphemeral(t *testing.T) {
@@ -1139,7 +1527,6 @@ func TestReanchor_NoHooks(t *testing.T) {
 }
 
 func TestReanchor_PTUAnchoredToTool(t *testing.T) {
-	// System PTU after tool message → anchored into tool content
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"read file"},
@@ -1154,35 +1541,25 @@ func TestReanchor_PTUAnchoredToTool(t *testing.T) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
 
-	// Hook anchored: 6 original → 5 (PTU absorbed into tool)
+	// 6 original → 5 (PTU absorbed into tool)
 	count := gjson.GetBytes(out, "messages.#").Int()
 	if count != 5 {
 		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
 	}
 
-	// Tool content should now include hook text
 	toolContent := gjson.GetBytes(out, "messages.3.content").String()
 	if !strings.Contains(toolContent, "file contents here") {
-		t.Fatalf("tool content should retain original output")
+		t.Fatalf("tool content should retain original output: %s", toolContent)
 	}
-	if !strings.Contains(toolContent, "[hook:PreToolUse:Read]") {
-		t.Fatalf("tool content should contain anchored hook label, got: %s", toolContent)
+	if !strings.Contains(toolContent, "---\nPreToolUse:Read") {
+		t.Fatalf("tool content should contain anchored hook with separator, got: %s", toolContent)
 	}
 	if !strings.Contains(toolContent, "Read files in parallel") {
 		t.Fatalf("tool content should contain hook text, got: %s", toolContent)
 	}
-
-	// Hook message should be gone
-	for i := int64(0); i < count; i++ {
-		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if strings.Contains(c, "PreToolUse:") && gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String() != "tool" {
-			t.Fatalf("PTU should no longer be a standalone message at index %d: %s", i, c)
-		}
-	}
 }
 
 func TestReanchor_PostToolUseAnchoredToTool(t *testing.T) {
-	// User-role PostToolUse after tool → anchored into tool content
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1203,16 +1580,37 @@ func TestReanchor_PostToolUseAnchoredToTool(t *testing.T) {
 	}
 
 	toolContent := gjson.GetBytes(out, "messages.3.content").String()
-	if !strings.Contains(toolContent, "[hook:PostToolUse:Bash]") {
-		t.Fatalf("tool content should contain PostToolUse label, got: %s", toolContent)
+	if !strings.Contains(toolContent, "PostToolUse:Bash") {
+		t.Fatalf("tool content should contain PostToolUse text, got: %s", toolContent)
 	}
 	if !strings.Contains(toolContent, "Command succeeded") {
-		t.Fatalf("tool content should contain hook text, got: %s", toolContent)
+		t.Fatalf("tool content should contain hook body, got: %s", toolContent)
+	}
+}
+
+func TestReanchor_PostToolUseCounterPreserved(t *testing.T) {
+	// Standalone PostToolUse with counter — must be preserved in full
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"output"},
+		{"role":"user","content":"PostToolUse:Read hook additional context: Extensive reading (12 files)."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	toolContent := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(toolContent, "12 files") {
+		t.Fatalf("PostToolUse counter must be preserved, got: %s", toolContent)
 	}
 }
 
 func TestReanchor_PostToolUseFailureAnchoredToTool(t *testing.T) {
-	// System-role PostToolUseFailure after tool → anchored
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1233,16 +1631,15 @@ func TestReanchor_PostToolUseFailureAnchoredToTool(t *testing.T) {
 	}
 
 	toolContent := gjson.GetBytes(out, "messages.3.content").String()
-	if !strings.Contains(toolContent, "[hook:PostToolUseFailure:mcp__chrome") {
-		t.Fatalf("tool content should contain PostToolUseFailure label, got: %s", toolContent)
+	if !strings.Contains(toolContent, "PostToolUseFailure:mcp__chrome") {
+		t.Fatalf("tool content should contain PostToolUseFailure text, got: %s", toolContent)
 	}
 	if !strings.Contains(toolContent, "Tool failed") {
-		t.Fatalf("tool content should contain failure text, got: %s", toolContent)
+		t.Fatalf("tool content should contain failure body, got: %s", toolContent)
 	}
 }
 
 func TestReanchor_MultipleHooksAnchoredToSameTool(t *testing.T) {
-	// Two consecutive hook messages after tool → both anchored
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1265,16 +1662,16 @@ func TestReanchor_MultipleHooksAnchoredToSameTool(t *testing.T) {
 	}
 
 	toolContent := gjson.GetBytes(out, "messages.3.content").String()
-	if !strings.Contains(toolContent, "[hook:PreToolUse:Read]") {
-		t.Fatalf("missing PreToolUse label in: %s", toolContent)
+	if !strings.Contains(toolContent, "PreToolUse:Read") {
+		t.Fatalf("missing PreToolUse in: %s", toolContent)
 	}
-	if !strings.Contains(toolContent, "[hook:PostToolUse:Read]") {
-		t.Fatalf("missing PostToolUse label in: %s", toolContent)
+	if !strings.Contains(toolContent, "PostToolUse:Read") {
+		t.Fatalf("missing PostToolUse in: %s", toolContent)
 	}
 }
 
 func TestReanchor_HookNotAdjacentToToolKeptAsIs(t *testing.T) {
-	// Hook NOT after a tool (separated by assistant) → kept as standalone message
+	// Hook NOT after a tool and no tool within look-back → kept as standalone
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1294,7 +1691,6 @@ func TestReanchor_HookNotAdjacentToToolKeptAsIs(t *testing.T) {
 		t.Fatalf("expected 5 messages (no change), got %d: %s", count, string(out))
 	}
 
-	// PTU should still exist as standalone system message
 	found := false
 	for i := int64(0); i < count; i++ {
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
@@ -1310,7 +1706,7 @@ func TestReanchor_HookNotAdjacentToToolKeptAsIs(t *testing.T) {
 }
 
 func TestReanchor_PostToolUseFailureLookback(t *testing.T) {
-	// PostToolUseFailure 2 positions after tool (with user message in between) → anchored via look-back
+	// PostToolUseFailure with a user message between it and the tool → anchored via look-back
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1326,13 +1722,13 @@ func TestReanchor_PostToolUseFailureLookback(t *testing.T) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
 
-	// PostToolUseFailure 2 away from tool → look-back succeeds → anchored
+	// PostToolUseFailure 2 away from tool, with user in between → anchored (user is transparent)
 	count := gjson.GetBytes(out, "messages.#").Int()
 	if count != 6 {
 		t.Fatalf("expected 6 messages, got %d: %s", count, string(out))
 	}
 
-	// Check that hook was anchored (no standalone PostToolUseFailure message)
+	// Check that hook was anchored
 	for i := int64(0); i < count; i++ {
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
@@ -1342,8 +1738,45 @@ func TestReanchor_PostToolUseFailureLookback(t *testing.T) {
 	}
 }
 
+func TestReanchor_AssistantResetsAnchorChain(t *testing.T) {
+	// Assistant message between tool and hook → chain reset → hook NOT anchored
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"bash output"},
+		{"role":"assistant","content":"let me think..."},
+		{"role":"system","content":"PreToolUse:Read hook additional context: parallel reads."},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// Assistant between tool and PTU → chain reset → hook kept
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 7 {
+		t.Fatalf("expected 7 messages (no anchoring), got %d: %s", count, string(out))
+	}
+
+	// PTU still standalone
+	found := false
+	for i := int64(0); i < count; i++ {
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		if r == "system" && strings.Contains(c, "PreToolUse:Read") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("PTU after assistant should remain standalone: %s", string(out))
+	}
+}
+
 func TestReanchor_PreservesConversationContent(t *testing.T) {
-	// Verify all non-hook messages remain unchanged
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"what is the weather"},
@@ -1358,22 +1791,19 @@ func TestReanchor_PreservesConversationContent(t *testing.T) {
 		t.Fatalf("output is not valid JSON: %s", string(out))
 	}
 
-	// System prompt unchanged
 	if gjson.GetBytes(out, "messages.0.content").String() != "You are Claude." {
 		t.Fatalf("system prompt changed")
 	}
-	// User query unchanged
 	if gjson.GetBytes(out, "messages.1.content").String() != "what is the weather" {
 		t.Fatalf("user query changed")
 	}
-	// Final assistant unchanged
 	if gjson.GetBytes(out, "messages.4.content").String() != "The weather is sunny, 72F." {
 		t.Fatalf("assistant response changed")
 	}
 }
 
 func TestReanchor_StripPostToolUseSuffix(t *testing.T) {
-	// PTU with PostToolUse counter suffix → suffix stripped before anchoring
+	// PTU system message with embedded PostToolUse suffix → suffix stripped
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1389,9 +1819,9 @@ func TestReanchor_StripPostToolUseSuffix(t *testing.T) {
 	}
 
 	toolContent := gjson.GetBytes(out, "messages.3.content").String()
-	// Suffix "(12 files)" should not appear
+	// Embedded PostToolUse suffix should be stripped from PTU
 	if strings.Contains(toolContent, "12 files") {
-		t.Fatalf("PostToolUse suffix noise should be stripped, got: %s", toolContent)
+		t.Fatalf("embedded PostToolUse suffix should be stripped from PTU, got: %s", toolContent)
 	}
 	// Core PTU content should remain
 	if !strings.Contains(toolContent, "parallel reads") {
@@ -1400,7 +1830,6 @@ func TestReanchor_StripPostToolUseSuffix(t *testing.T) {
 }
 
 func TestReanchor_SystemReminderWrapperStripped(t *testing.T) {
-	// User-role PostToolUse with <system-reminder> wrapper → stripped
 	body := []byte(`{"messages":[
 		{"role":"system","content":"You are Claude."},
 		{"role":"user","content":"query"},
@@ -1424,9 +1853,32 @@ func TestReanchor_SystemReminderWrapperStripped(t *testing.T) {
 	}
 }
 
+func TestReanchor_ArrayHookContentSkipped(t *testing.T) {
+	// Hook with array content but no matching text element → skipped, kept as-is
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude."},
+		{"role":"user","content":"query"},
+		{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":"output"},
+		{"role":"user","content":[{"type":"image","url":"data:..."}]},
+		{"role":"assistant","content":"done"}
+	]}`)
+
+	out := ReanchorHooks(body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+
+	// Array content with no PreToolUse/PostToolUse text → not detected as hook
+	// → nothing changed
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 6 {
+		t.Fatalf("expected 6 messages (no change), got %d: %s", count, string(out))
+	}
+}
+
 func TestReanchor_FullPipelineWithReanchor(t *testing.T) {
 	// Full pipeline: normalize → dedup → reanchor → canonical
-	// Realistic scenario: PTU and PostToolUse hook messages after a tool result
 	ptuText := `<system-reminder>
 PreToolUse:Read hook additional context: Read multiple files in parallel when possible for faster analysis.
 </system-reminder>`
@@ -1457,19 +1909,22 @@ PostToolUse:Read hook additional context: Extensive reading (5 files).
 		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
 	}
 
-	// Tool content should have anchored hook text from both PTU and PostToolUse
 	toolContent := gjson.GetBytes(out, "messages.3.content").String()
-	if !strings.Contains(toolContent, "[hook:PreToolUse:Read]") {
+	if !strings.Contains(toolContent, "PreToolUse:Read") {
 		t.Fatalf("tool content should contain PreToolUse hook, got: %s", toolContent)
 	}
-	if !strings.Contains(toolContent, "[hook:PostToolUse:Read]") {
+	if !strings.Contains(toolContent, "PostToolUse:Read") {
 		t.Fatalf("tool content should contain PostToolUse hook, got: %s", toolContent)
 	}
 	if !strings.Contains(toolContent, "parallel") {
-		t.Fatalf("tool content should contain PreToolUse body text: %s", toolContent)
+		t.Fatalf("tool content should contain PreToolUse body: %s", toolContent)
+	}
+	// PostToolUse counter preserved
+	if !strings.Contains(toolContent, "5 files") {
+		t.Fatalf("PostToolUse counter should be preserved, got: %s", toolContent)
 	}
 
-	// No standalone hook messages remain (only 1 system: "You are Claude.")
+	// No standalone hook messages
 	sysCount := 0
 	for i := int64(0); i < count; i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
@@ -1481,7 +1936,6 @@ PostToolUse:Read hook additional context: Extensive reading (5 files).
 		t.Fatalf("expected 1 system message, got %d: %s", sysCount, string(out))
 	}
 
-	// No PostToolUse in output as standalone message
 	outStr := string(out)
 	hookRoles := 0
 	for i := int64(0); i < count; i++ {
