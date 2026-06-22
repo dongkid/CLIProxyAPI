@@ -232,21 +232,50 @@ func CollapseTaskReminders(body []byte) []byte {
 		return body
 	}
 
-	// Find an existing task-list user message from a previous split
-	// and replace it. Otherwise append at the end.
-	taskListPath := ""
-	replaced := false
+	// Scan all task-list user messages from previous splits.
+	// Delete every zombie copy except the last, then replace its content.
+	taskListIdxs := make([]int, 0)
 	for i := len(outMsgs) - 1; i >= 0; i-- {
 		r := outMsgs[i].Get("role").String()
 		c := outMsgs[i].Get("content")
 		if r == "user" && c.Type == gjson.String && strings.HasPrefix(c.String(), "[task-list]") {
-			taskListPath = fmt.Sprintf("messages.%d.content", i)
-			replaced = true
-			break
+			taskListIdxs = append([]int{i}, taskListIdxs...)
 		}
 	}
 
-	if replaced {
+	replaced := len(taskListIdxs) > 0
+	if len(taskListIdxs) > 1 {
+		// Delete all but the last zombie copy.
+		zombies := taskListIdxs[:len(taskListIdxs)-1]
+		for i := len(zombies) - 1; i >= 0; i-- {
+			path := fmt.Sprintf("messages.%d", zombies[i])
+			var delErr error
+			out, delErr = sjson.DeleteBytes(out, path)
+			if delErr != nil {
+				log.WithField("module", "system_dedup").Warnf("task-collapse: failed to delete zombie task-list messages.%d: %v", zombies[i], delErr)
+				return body
+			}
+		}
+		log.WithFields(log.Fields{
+			"module":  "system_dedup",
+			"zombies": len(zombies),
+		}).Debug("system_dedup: removed zombie task-list copies [cpa-task-collapse]")
+	}
+
+	// Scan again after deletions to find the surviving task-list index.
+	outMsgs2 := gjson.GetBytes(out, "messages").Array()
+	taskListPath := ""
+	for i := len(outMsgs2) - 1; i >= 0; i-- {
+		if outMsgs2[i].Get("role").String() == "user" {
+			c := outMsgs2[i].Get("content")
+			if c.Type == gjson.String && strings.HasPrefix(c.String(), "[task-list]") {
+				taskListPath = fmt.Sprintf("messages.%d.content", i)
+				break
+			}
+		}
+	}
+
+	if taskListPath != "" {
 		raw := gjson.GetBytes(taskListMsg, "content").Raw
 		out, setErr = sjson.SetRawBytes(out, taskListPath, []byte(raw))
 	} else {
@@ -407,6 +436,93 @@ func normalizeNotification(content string) string {
 		return content
 	}
 	return strings.TrimRight(content[:idx], "\n\r") + notificationPlaceholder
+}
+
+// CollapseUnknownSystemMessages keeps only the most recent system message
+// that is not already handled by the targeted collapse functions (PROMPT,
+// AGENT, task reminders, and notifications). This covers any CC-injected
+// message type we haven't explicitly catalogued — e.g. user-interruption
+// notifications ("The user sent a new message while you were working").
+//
+// Without this, each new CC-injected system message permanently increments
+// the syncount and causes a KV cache snowball.
+//
+// Logs at debug level when unknown messages are collapsed [cpa-task-collapse].
+func CollapseUnknownSystemMessages(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() || len(messages.Array()) < 2 {
+		return body
+	}
+
+	arr := messages.Array()
+	unknownIdxs := make([]int, 0)
+
+	for i := range arr {
+		role := arr[i].Get("role").String()
+		if role != "system" {
+			continue
+		}
+		content := arr[i].Get("content")
+		if content.Type != gjson.String {
+			continue
+		}
+		s := content.String()
+		if strings.HasPrefix(s, "Available agent types") ||
+			strings.HasPrefix(s, taskReminderPrefix) ||
+			strings.HasPrefix(s, sysNotificationPrefix) {
+			continue
+		}
+		unknownIdxs = append(unknownIdxs, i)
+	}
+
+	if len(unknownIdxs) <= 1 {
+		return body
+	}
+
+	keepIdx := unknownIdxs[len(unknownIdxs)-1]
+	removeIdxs := unknownIdxs[:len(unknownIdxs)-1]
+
+	for _, idx := range removeIdxs {
+		log.WithFields(log.Fields{
+			"module":  "system_dedup",
+			"at":      idx,
+			"keep_at": keepIdx,
+		}).Debug("system_dedup: collapsing unknown system message [cpa-task-collapse]")
+	}
+
+	out := body
+	collapsed := 0
+	for i := len(removeIdxs) - 1; i >= 0; i-- {
+		path := fmt.Sprintf("messages.%d", removeIdxs[i])
+		var err error
+		out, err = sjson.DeleteBytes(out, path)
+		if err != nil {
+			log.WithField("module", "system_dedup").Warnf("task-collapse: failed to delete unknown messages.%d: %v", removeIdxs[i], err)
+			return body
+		}
+		collapsed++
+	}
+
+	log.WithFields(log.Fields{
+		"module":  "system_dedup",
+		"removed": collapsed,
+		"kept":    keepIdx,
+	}).Debug("system_dedup: collapsed unknown system messages [cpa-task-collapse]")
+
+	return out
+}
+
+// isKnownSystemMessage returns true for CC-injected system message types
+// that are already covered by targeted collapse functions (and therefore
+// should be excluded from the generic unknown-message collapse).
+func isKnownSystemMessage(content gjson.Result) bool {
+	if content.Type != gjson.String {
+		return false
+	}
+	s := content.String()
+	return strings.HasPrefix(s, "Available agent types") ||
+		strings.HasPrefix(s, taskReminderPrefix) ||
+		strings.HasPrefix(s, sysNotificationPrefix)
 }
 
 // AppendEphemeralSystemMessages moves PreToolUse/PostToolUse hook context

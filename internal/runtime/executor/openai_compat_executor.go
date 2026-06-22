@@ -201,8 +201,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
-			translated = helps.CollapseSystemNotifications(translated) // [cpa-task-collapse]
-			translated = helps.CollapseTaskReminders(translated)       // [cpa-task-collapse]
+			translated = helps.CollapseSystemNotifications(translated)   // [cpa-task-collapse]
+			translated = helps.CollapseTaskReminders(translated)         // [cpa-task-collapse]
+			translated = helps.CollapseUnknownSystemMessages(translated) // [cpa-task-collapse]
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
 			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
@@ -455,8 +456,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
-			translated = helps.CollapseSystemNotifications(translated) // [cpa-task-collapse]
-			translated = helps.CollapseTaskReminders(translated)       // [cpa-task-collapse]
+			translated = helps.CollapseSystemNotifications(translated)   // [cpa-task-collapse]
+			translated = helps.CollapseTaskReminders(translated)         // [cpa-task-collapse]
+			translated = helps.CollapseUnknownSystemMessages(translated) // [cpa-task-collapse]
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
 			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]

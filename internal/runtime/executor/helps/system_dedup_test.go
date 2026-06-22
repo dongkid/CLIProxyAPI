@@ -408,6 +408,33 @@ func TestCollapseTask_ReplaceExistingTaskList(t *testing.T) {
 	}
 }
 
+func TestCollapseTask_ZombieTaskListCleanup(t *testing.T) {
+	// Three zombie [task-list] messages + 1 new reminder.
+	// Only the latest (with Task D) survives, all zombies removed.
+	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"[task-list]\n#1. Old Task A\n[/task-list]"},{"role":"user","content":"something else"},{"role":"user","content":"[task-list]\n#1. Old Task B\n[/task-list]"},{"role":"assistant","content":"ok"},{"role":"user","content":"[task-list]\n#1. Old Task C\n[/task-list]"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task D"}]}`)
+	out := CollapseTaskReminders(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	taskListCount := 0
+	var kept string
+	for i := 0; i < int(count); i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if r == "user" && strings.HasPrefix(c, "[task-list]") {
+			taskListCount++
+			kept = c
+		}
+	}
+	if taskListCount != 1 {
+		t.Fatalf("expected exactly 1 task-list user message, got %d: %s", taskListCount, string(out))
+	}
+	if !strings.Contains(kept, "Task D") {
+		t.Fatalf("surviving task-list should contain Task D, got: %s", kept)
+	}
+	if strings.Contains(kept, "Old Task") {
+		t.Fatalf("zombie content should be gone, got: %s", kept)
+	}
+}
+
 // --- CollapseSystemNotifications tests ---
 
 func TestCollapseNotif_NoMessages(t *testing.T) {
@@ -552,6 +579,77 @@ func TestCollapseNotif_NoMarker(t *testing.T) {
 	kept := gjson.GetBytes(out, "messages.0.content").String()
 	if kept != "[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification." {
 		t.Fatalf("without marker, content should be unchanged, got: %s", kept)
+	}
+}
+
+// --- CollapseUnknownSystemMessages tests ---
+
+func TestCollapseUnknown_None(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"Available agent types: claude, explore"},{"role":"user","content":"hi"}]}`)
+	out := CollapseUnknownSystemMessages(body)
+	if string(out) != string(body) {
+		t.Fatalf("known type should be skipped, got %s", string(out))
+	}
+}
+
+func TestCollapseUnknown_Single(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"Available agent types..."},{"role":"system","content":"The user sent a new message while you were working: stop"},{"role":"user","content":"hi"}]}`)
+	out := CollapseUnknownSystemMessages(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 3 {
+		t.Fatalf("single unknown should be kept, got %d: %s", count, string(out))
+	}
+}
+
+func TestCollapseUnknown_Multiple(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"Available agent types..."},{"role":"user","content":"start"},{"role":"system","content":"The user sent a new message while you were working: first"},{"role":"assistant","content":"ok"},{"role":"system","content":"The user sent a new message while you were working: second"},{"role":"system","content":"The user sent a new message while you were working: third"}]}`)
+	out := CollapseUnknownSystemMessages(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 4 {
+		t.Fatalf("expected 4 messages (3 unknowns collapsed to 1), got %d: %s", count, string(out))
+	}
+	kept := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.Contains(kept, "third") {
+		t.Fatalf("kept should be latest (third), got: %s", kept)
+	}
+}
+
+func TestCollapseUnknown_AllCollapsesTogether(t *testing.T) {
+	// Notif + task reminder + unknown interruption — all three collapses run in order
+	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"u1"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task B"},{"role":"system","content":"The user sent a new message while you were working: pause"},{"role":"system","content":"The user sent a new message while you were working: stop now"},{"role":"assistant","content":"a1"}]}`)
+	out := CollapseSystemNotifications(body)
+	out = CollapseTaskReminders(out)
+	out = CollapseUnknownSystemMessages(out)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	// Verify: 1 notif, 1 task preamble, 1 unknown, + other msgs
+	notifCount := 0
+	taskCount := 0
+	unknownCount := 0
+	for i := 0; i < int(count); i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
+		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
+		if r != "system" {
+			continue
+		}
+		if strings.HasPrefix(c, sysNotificationPrefix) {
+			notifCount++
+		}
+		if strings.HasPrefix(c, taskReminderPrefix) {
+			taskCount++
+		}
+		if strings.HasPrefix(c, "The user sent a new message") {
+			unknownCount++
+		}
+	}
+	_ = count
+	if notifCount != 1 {
+		t.Fatalf("expected 1 notif, got %d", notifCount)
+	}
+	if taskCount != 1 {
+		t.Fatalf("expected 1 task preamble, got %d", taskCount)
+	}
+	if unknownCount != 1 {
+		t.Fatalf("expected 1 unknown, got %d", unknownCount)
 	}
 }
 
