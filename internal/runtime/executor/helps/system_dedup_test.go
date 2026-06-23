@@ -186,51 +186,46 @@ func TestCollapseTask_NoTaskReminders(t *testing.T) {
 }
 
 func TestCollapseTask_SingleTaskReminder(t *testing.T) {
-	// Single reminder → preamble stays system, task list extracted to new user message
+	// Single reminder → converted to <system-reminder> user message (in-place)
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks, consider using TaskCreate.\n\nHere are the existing tasks:\n\n#1. [in_progress] Do thing"}]}`)
 	out := CollapseTaskReminders(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 3 {
-		t.Fatalf("expected 3 messages (sys_prompt + system_preamble + user_tasklist), got %d: %s", count, string(out))
+	if count != 2 {
+		t.Fatalf("expected 2 messages (in-place conversion), got %d: %s", count, string(out))
 	}
-	// System message should have anchor tag, NOT the task list
-	sysContent := gjson.GetBytes(out, "messages.1.content").String()
-	if !strings.Contains(sysContent, "current task list follows") {
-		t.Fatalf("system preamble should have anchor tag, got: %s", sysContent)
+	// Message at index 1 should be user with <system-reminder> wrapper
+	r := gjson.GetBytes(out, "messages.1.role").String()
+	if r != "user" {
+		t.Fatalf("expected user role, got %s", r)
 	}
-	if strings.Contains(sysContent, "Do thing") {
-		t.Fatalf("system preamble should NOT contain task list, got: %s", sysContent)
+	c := gjson.GetBytes(out, "messages.1.content").String()
+	if !strings.HasPrefix(c, "<system-reminder>") {
+		t.Fatalf("expected <system-reminder> wrapper, got: %s", c[:50])
 	}
-	// User message should have the task list
-	userContent := gjson.GetBytes(out, "messages.2.content").String()
-	if !strings.Contains(userContent, "[task-list]") || !strings.Contains(userContent, "Do thing") {
-		t.Fatalf("user message should contain task list, got: %s", userContent)
+	if !strings.Contains(c, "Do thing") {
+		t.Fatalf("task list content should be preserved, got: %s", c)
 	}
 }
 
 func TestCollapseTask_MultipleTaskReminders(t *testing.T) {
-	// Two variants → collapsed to 1, task list extracted to user message
+	// Two variants → collapsed to 1, converted to <system-reminder> user
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"start"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A"},{"role":"assistant","content":"ok"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A\n#2. [in_progress] Task B"}]}`)
 	out := CollapseTaskReminders(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 5 {
-		t.Fatalf("expected 5 messages, got %d: %s", count, string(out))
+	if count != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
 	}
-	// Second reminder (at index 3 after collapse) should be system with preamble
-	sysContent := gjson.GetBytes(out, "messages.3.content").String()
-	if strings.Contains(sysContent, "Task B") {
-		t.Fatalf("system preamble should NOT contain task list, got: %s", sysContent)
+	// Message at index 3 should be user with <system-reminder> containing most complete task list
+	r := gjson.GetBytes(out, "messages.3.role").String()
+	if r != "user" {
+		t.Fatalf("expected user role, got %s", r)
 	}
-	if !strings.Contains(sysContent, "current task list follows") {
-		t.Fatalf("system preamble should have anchor tag, got: %s", sysContent)
+	c := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.HasPrefix(c, "<system-reminder>") {
+		t.Fatalf("expected <system-reminder> wrapper, got: %s", c[:50])
 	}
-	// User message at end should have most complete task list
-	userContent := gjson.GetBytes(out, "messages.4.content").String()
-	if !strings.Contains(userContent, "Task B") {
-		t.Fatalf("user message should contain most complete task list, got: %s", userContent)
-	}
-	if !strings.Contains(userContent, "[task-list]") || !strings.Contains(userContent, "[/task-list]") {
-		t.Fatalf("user message should be wrapped in [task-list] tags, got: %s", userContent)
+	if !strings.Contains(c, "Task B") {
+		t.Fatalf("should contain most complete task list, got: %s", c)
 	}
 }
 
@@ -238,19 +233,16 @@ func TestCollapseTask_OnlyTaskReminders(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B\n#3. Task C"}]}`)
 	out := CollapseTaskReminders(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 2 {
-		t.Fatalf("expected 2 messages (sys_preamble + user_tasklist), got %d: %s", count, string(out))
+	if count != 1 {
+		t.Fatalf("expected 1 message (converted in-place), got %d: %s", count, string(out))
 	}
-	sysContent := gjson.GetBytes(out, "messages.0.content").String()
-	if !strings.Contains(sysContent, "current task list follows") {
-		t.Fatalf("system should have anchor tag, got: %s", sysContent)
+	r := gjson.GetBytes(out, "messages.0.role").String()
+	if r != "user" {
+		t.Fatalf("expected user role, got %s", r)
 	}
-	if strings.Contains(sysContent, "Task C") {
-		t.Fatalf("system preamble should NOT contain task list, got: %s", sysContent)
-	}
-	userContent := gjson.GetBytes(out, "messages.1.content").String()
-	if !strings.Contains(userContent, "Task C") {
-		t.Fatalf("user message should have most complete task list, got: %s", userContent)
+	c := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.Contains(c, "Task C") {
+		t.Fatalf("should contain most complete task list, got: %s", c)
 	}
 }
 
@@ -258,32 +250,23 @@ func TestCollapseTask_MixedWithNormalMessages(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"q1"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"assistant","content":"a1"},{"role":"tool","content":"t1"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"},{"role":"user","content":"q2"}]}`)
 	out := CollapseTaskReminders(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 7 {
-		t.Fatalf("expected 7 messages, got %d: %s", count, string(out))
+	if count != 6 {
+		t.Fatalf("expected 6 messages, got %d: %s", count, string(out))
 	}
-	// Find the system reminder — should have anchor, not task list
-	var sysFound, userFound bool
+	// Find the converted <system-reminder> user message
+	var found bool
 	for i := 0; i < int(count); i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
-			sysFound = true
-			if strings.Contains(c, "Task A") {
-				t.Fatalf("system preamble should NOT contain task list, got: %s", c)
-			}
-		}
-		if r == "user" && strings.Contains(c, "[task-list]") {
-			userFound = true
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			found = true
 			if !strings.Contains(c, "Task B") {
-				t.Fatalf("user task-list should have most complete version, got: %s", c)
+				t.Fatalf("should contain most complete task list, got: %s", c)
 			}
 		}
 	}
-	if !sysFound {
-		t.Fatal("system reminder with preamble not found")
-	}
-	if !userFound {
-		t.Fatal("user task-list message not found")
+	if !found {
+		t.Fatal("<system-reminder> task reminder user message not found")
 	}
 }
 
@@ -298,75 +281,68 @@ func TestCollapseTask_ArrayContentNotCollapsed(t *testing.T) {
 }
 
 func TestCollapseTask_DedupThenCollapse(t *testing.T) {
-	// dedup removes exact copies, collapse splits preamble+task-list
+	// dedup removes exact copies, CollapseTaskReminders converts to <system-reminder> user
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"user","content":"hi"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A\n#2. Task B"}]}`)
 	out := DeduplicateSystemMessages(body)
 	out = CollapseTaskReminders(out)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 4 {
-		t.Fatalf("expected 4 messages (sys_prompt + sys_preamble + user_hi + user_tasklist), got %d: %s", count, string(out))
+	if count != 3 {
+		t.Fatalf("expected 3 messages (sys_prompt + user_hi + <system-reminder>), got %d: %s", count, string(out))
 	}
-	// Find system preamble and user task-list
-	var sysOk, userOk bool
+	// Find <system-reminder> user message with most complete task list
+	var found bool
 	for i := 0; i < int(count); i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
-			sysOk = true
-			if strings.Contains(c, "Task B") {
-				t.Fatalf("system preamble should NOT contain task list, got: %s", c)
-			}
-			if !strings.Contains(c, "current task list follows") {
-				t.Fatalf("system preamble should have anchor tag, got: %s", c)
-			}
-		}
-		if r == "user" && strings.Contains(c, "[task-list]") {
-			userOk = true
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			found = true
 			if !strings.Contains(c, "Task B") {
-				t.Fatalf("user task-list should have most complete version, got: %s", c)
+				t.Fatalf("should contain most complete task list, got: %s", c)
 			}
 		}
 	}
-	if !sysOk {
-		t.Fatal("system preamble with anchor not found")
-	}
-	if !userOk {
-		t.Fatal("user task-list message not found")
+	if !found {
+		t.Fatal("<system-reminder> task reminder user message not found")
 	}
 }
 
 func TestCollapseTask_SplitReminder(t *testing.T) {
-	// Single reminder → preamble stays system, task list extracted to user
+	// Single reminder → converted to <system-reminder> user (in-place)
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"hi"},{"role":"system","content":"The task tools haven't been used recently. If you are working on tasks, consider using TaskCreate.\n\nHere are the existing tasks:\n\n#1. [in_progress] Some task\n#2. [pending] Another"}]}`)
 	out := CollapseTaskReminders(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 4 {
-		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	if count != 3 {
+		t.Fatalf("expected 3 messages (in-place conversion), got %d: %s", count, string(out))
 	}
-	sysContent := gjson.GetBytes(out, "messages.2.content").String()
-	if !strings.Contains(sysContent, "current task list follows") {
-		t.Fatalf("system should have anchor, got: %s", sysContent)
+	c := gjson.GetBytes(out, "messages.2.content").String()
+	if !strings.HasPrefix(c, "<system-reminder>") {
+		t.Fatalf("expected <system-reminder>, got: %s", c[:50])
 	}
-	userContent := gjson.GetBytes(out, "messages.3.content").String()
-	if !strings.Contains(userContent, "Some task") || !strings.Contains(userContent, "Another") {
-		t.Fatalf("user message should contain complete task list, got: %s", userContent)
+	if !strings.Contains(c, "Some task") || !strings.Contains(c, "Another") {
+		t.Fatalf("should contain complete task list, got: %s", c)
 	}
 }
 
 func TestCollapseTask_NoTaskListMarker(t *testing.T) {
-	// Reminder without task list marker → splitTaskReminder returns empty taskList → body unchanged
+	// Reminder without task list marker → still converted to <system-reminder> user
 	body := []byte(`{"messages":[{"role":"system","content":"The task tools haven't been used recently. Just a plain reminder."},{"role":"user","content":"hi"}]}`)
 	out := CollapseTaskReminders(body)
-	// Since no task list marker: splitTaskReminder returns taskList="", function returns out unchanged
-	// (the msg stays as-is because there's nothing to extract)
 	count := gjson.GetBytes(out, "messages.#").Int()
 	if count != 2 {
-		t.Fatalf("expected 2 messages (unchanged), got %d: %s", count, string(out))
+		t.Fatalf("expected 2 messages (in-place), got %d: %s", count, string(out))
+	}
+	r := gjson.GetBytes(out, "messages.0.role").String()
+	if r != "user" {
+		t.Fatalf("expected user role, got %s", r)
+	}
+	c := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.HasPrefix(c, "<system-reminder>") {
+		t.Fatalf("expected <system-reminder> wrapper, got: %s", c)
 	}
 }
 
 func TestCollapseTask_IdempotentSplit(t *testing.T) {
-	// Running collapse twice must produce identical results (no duplicate task-list messages)
+	// Running collapse twice must produce identical results
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A"}]}`)
 	out1 := CollapseTaskReminders(body)
 	out2 := CollapseTaskReminders(out1)
@@ -381,57 +357,46 @@ func TestCollapseTask_IdempotentSplit(t *testing.T) {
 }
 
 func TestCollapseTask_ReplaceExistingTaskList(t *testing.T) {
-	// Simulate two consecutive requests where the task list changes
-	// Request 1: Task A
-	body1 := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Task A"}]}`)
-	_ = CollapseTaskReminders(body1) // first split: produces preamble + task-list user msg
-
-	// Request 2 builds on out1 (history + new messages from CC)
-	// CC injects a new task reminder with Task A + Task B
+	// Simulate two consecutive requests where the task list changes.
+	// Request 2 injects updated task state → converted <system-reminder> should reflect it.
 	body2 := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Task A\n#2. [in_progress] Task B"},{"role":"user","content":"Continue working."}]}`)
 	out2 := CollapseTaskReminders(body2)
 
-	// After both passes, there should be exactly 1 task-list user message
-	taskListCount := 0
+	// Find <system-reminder> user message with latest task state
+	var found bool
 	for i := 0; i < int(gjson.GetBytes(out2, "messages.#").Int()); i++ {
 		r := gjson.GetBytes(out2, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out2, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "user" && strings.HasPrefix(c, "[task-list]") {
-			taskListCount++
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			found = true
 			if !strings.Contains(c, "Task B") || !strings.Contains(c, "completed") {
-				t.Fatalf("task list should reflect latest state (Task A completed, Task B in_progress), got: %s", c)
+				t.Fatalf("should reflect latest state (Task A completed, Task B in_progress), got: %s", c)
 			}
 		}
 	}
-	if taskListCount != 1 {
-		t.Fatalf("expected exactly 1 task-list user message, got %d: %s", taskListCount, string(out2))
+	if !found {
+		t.Fatal("<system-reminder> task reminder user message not found")
 	}
 }
 
 func TestCollapseTask_ZombieTaskListCleanup(t *testing.T) {
-	// Three zombie [task-list] messages + 1 new reminder.
-	// Only the latest (with Task D) survives, all zombies removed.
+	// Old [task-list] messages from previous code version + new <system-reminder> conversion.
+	// Old [task-list] messages are left untouched (they're historical data), new one is converted.
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"[task-list]\n#1. Old Task A\n[/task-list]"},{"role":"user","content":"something else"},{"role":"user","content":"[task-list]\n#1. Old Task B\n[/task-list]"},{"role":"assistant","content":"ok"},{"role":"user","content":"[task-list]\n#1. Old Task C\n[/task-list]"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task D"}]}`)
 	out := CollapseTaskReminders(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	taskListCount := 0
-	var kept string
+
+	// Find the new <system-reminder> user message
+	var found bool
 	for i := 0; i < int(count); i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "user" && strings.HasPrefix(c, "[task-list]") {
-			taskListCount++
-			kept = c
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "Task D") {
+			found = true
 		}
 	}
-	if taskListCount != 1 {
-		t.Fatalf("expected exactly 1 task-list user message, got %d: %s", taskListCount, string(out))
-	}
-	if !strings.Contains(kept, "Task D") {
-		t.Fatalf("surviving task-list should contain Task D, got: %s", kept)
-	}
-	if strings.Contains(kept, "Old Task") {
-		t.Fatalf("zombie content should be gone, got: %s", kept)
+	if !found {
+		t.Fatalf("converted <system-reminder> with Task D not found: %s", string(out))
 	}
 }
 
@@ -557,10 +522,10 @@ func TestCollapseNotif_WithTaskReminders(t *testing.T) {
 				t.Fatalf("notification should be normalized (embedded reminder stripped), got: %s", c)
 			}
 		}
-		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
 			taskPreambleCount++
-			if strings.Contains(c, "Here are the existing tasks") {
-				t.Fatalf("task preamble should NOT contain task list marker, got: %s", c)
+			if !strings.Contains(c, "Here are the existing tasks") {
+				t.Fatalf("task reminder should preserve task list marker, got: %s", c)
 			}
 		}
 	}
@@ -568,7 +533,7 @@ func TestCollapseNotif_WithTaskReminders(t *testing.T) {
 		t.Fatalf("expected 1 notification, got %d", notifCount)
 	}
 	if taskPreambleCount != 1 {
-		t.Fatalf("expected 1 task preamble, got %d", taskPreambleCount)
+		t.Fatalf("expected 1 task reminder as <system-reminder> user, got %d", taskPreambleCount)
 	}
 }
 
@@ -621,32 +586,38 @@ func TestCollapseUnknown_AllCollapsesTogether(t *testing.T) {
 	out = CollapseTaskReminders(out)
 	out = CollapseUnknownSystemMessages(out)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	// Verify: 1 notif, 1 task preamble, 1 unknown, + other msgs
+	// Verify: 1 notif (system), 1 task reminder (converted to <system-reminder> user), 1 unknown (system), + other msgs
 	notifCount := 0
-	taskCount := 0
+	taskUserCount := 0
+	taskSysCount := 0
 	unknownCount := 0
 	for i := 0; i < int(count); i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if r != "system" {
-			continue
+		if r == "system" {
+			if strings.HasPrefix(c, sysNotificationPrefix) {
+				notifCount++
+			}
+			if strings.HasPrefix(c, taskReminderPrefix) {
+				taskSysCount++
+			}
+			if strings.HasPrefix(c, "The user sent a new message") {
+				unknownCount++
+			}
 		}
-		if strings.HasPrefix(c, sysNotificationPrefix) {
-			notifCount++
-		}
-		if strings.HasPrefix(c, taskReminderPrefix) {
-			taskCount++
-		}
-		if strings.HasPrefix(c, "The user sent a new message") {
-			unknownCount++
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			taskUserCount++
 		}
 	}
 	_ = count
 	if notifCount != 1 {
 		t.Fatalf("expected 1 notif, got %d", notifCount)
 	}
-	if taskCount != 1 {
-		t.Fatalf("expected 1 task preamble, got %d", taskCount)
+	if taskSysCount != 0 {
+		t.Fatalf("expected 0 task reminders as system (should be converted to user), got %d", taskSysCount)
+	}
+	if taskUserCount != 1 {
+		t.Fatalf("expected 1 task reminder as <system-reminder> user, got %d", taskUserCount)
 	}
 	if unknownCount != 1 {
 		t.Fatalf("expected 1 unknown, got %d", unknownCount)
@@ -2045,5 +2016,800 @@ PostToolUse:Read hook additional context: Extensive reading (5 files).
 	}
 	if hookRoles > 0 {
 		t.Fatalf("hooks should be anchored into tool content, not standalone: %s", outStr)
+	}
+}
+
+func TestSkillListing_NoMessages(t *testing.T) {
+	out := ConvertSkillListingToUser([]byte(`{}`))
+	if !gjson.ValidBytes(out) {
+		t.Fatal("output should be valid JSON")
+	}
+}
+
+func TestSkillListing_NoSkillListing(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"You are Claude Code."},{"role":"user","content":"hello"}]}`)
+	out := ConvertSkillListingToUser(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d", count)
+	}
+	r0 := gjson.GetBytes(out, "messages.0.role").String()
+	if r0 != "system" {
+		t.Fatalf("expected system, got %s", r0)
+	}
+}
+
+func TestSkillListing_SingleConvertedToUser(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: A development workflow skill\n- code-review: Review code"}]}`)
+	out := ConvertSkillListingToUser(body)
+
+	r := gjson.GetBytes(out, "messages.0.role").String()
+	if r != "user" {
+		t.Fatalf("expected role=user, got %s", r)
+	}
+
+	c := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.HasPrefix(c, "<system-reminder>\n") {
+		t.Fatalf("expected <system-reminder> wrapper, got: %s", c[:min(50, len(c))])
+	}
+	if !strings.HasSuffix(c, "\n</system-reminder>") {
+		t.Fatalf("expected </system-reminder> suffix, got: %s", c[max(0, len(c)-50):])
+	}
+	if !strings.Contains(c, "The following skills are available") {
+		t.Fatal("original content should be preserved inside wrapper")
+	}
+}
+
+func TestSkillListing_AlreadyUserUnchanged(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill"}]}`)
+	out := ConvertSkillListingToUser(body)
+
+	r := gjson.GetBytes(out, "messages.0.role").String()
+	if r != "user" {
+		t.Fatalf("expected role=user, got %s", r)
+	}
+	// Should NOT double-wrap
+	c := gjson.GetBytes(out, "messages.0.content").String()
+	if strings.HasPrefix(c, "<system-reminder>\n<system-reminder>") {
+		t.Fatal("should not double-wrap already-user message")
+	}
+}
+
+func TestSkillListing_NonStringContentIgnored(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill"}]}]}`)
+	out := ConvertSkillListingToUser(body)
+
+	r := gjson.GetBytes(out, "messages.0.role").String()
+	if r != "system" {
+		t.Fatalf("array content should not be converted, got role=%s", r)
+	}
+}
+
+func TestSkillListing_MixedMessages(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude Code."},
+		{"role":"user","content":"hello"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill"},
+		{"role":"assistant","content":"Hi!"}
+	]}`)
+	out := ConvertSkillListingToUser(body)
+
+	// [0] system unchanged
+	r0 := gjson.GetBytes(out, "messages.0.role").String()
+	if r0 != "system" {
+		t.Fatalf("msg[0] should stay system, got %s", r0)
+	}
+	// [1] user unchanged
+	r1 := gjson.GetBytes(out, "messages.1.role").String()
+	if r1 != "user" {
+		t.Fatalf("msg[1] should stay user, got %s", r1)
+	}
+	// [2] skill listing converted
+	r2 := gjson.GetBytes(out, "messages.2.role").String()
+	if r2 != "user" {
+		t.Fatalf("msg[2] skill listing should be user, got %s", r2)
+	}
+	c2 := gjson.GetBytes(out, "messages.2.content").String()
+	if !strings.HasPrefix(c2, "<system-reminder>") {
+		t.Fatal("msg[2] should be wrapped in <system-reminder>")
+	}
+	// [3] assistant unchanged
+	r3 := gjson.GetBytes(out, "messages.3.role").String()
+	if r3 != "assistant" {
+		t.Fatalf("msg[3] should stay assistant, got %s", r3)
+	}
+}
+
+func TestSkillListing_Idempotent(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill"}]}`)
+
+	first := ConvertSkillListingToUser(body)
+	second := ConvertSkillListingToUser(first)
+
+	// Second pass should not change anything (message is already user, detection skips it)
+	if string(first) != string(second) {
+		t.Fatalf("ConvertSkillListingToUser should be idempotent\nfirst:  %s\nsecond: %s", string(first), string(second))
+	}
+}
+
+func TestSkillListing_WithTaskCollapse(t *testing.T) {
+	// Simulate full pipeline: task collapse then skill convert then unknown collapse
+	body := []byte(`{"messages":[
+		{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status.\n\nHere are the existing tasks:\n\n#1. [in_progress] Fix cache bug"},
+		{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate."},
+		{"role":"user","content":"continue"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill\n- code-review: skill"},
+		{"role":"system","content":"The user sent a new message while you were working. Interrupt your current work."},
+		{"role":"assistant","content":"ok"}
+	]}`)
+
+	// Step 1: CollapseTaskReminders
+	out := CollapseTaskReminders(body)
+	// Step 2: ConvertSkillListingToUser
+	out = ConvertSkillListingToUser(out)
+	// Step 3: CollapseUnknownSystemMessages
+	out = CollapseUnknownSystemMessages(out)
+
+	outStr := string(out)
+	msgs := gjson.GetBytes(out, "messages").Array()
+
+	// Count system messages after pipeline
+	sysCount := 0
+	userSkillCount := 0
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		if r == "system" {
+			sysCount++
+		}
+		if r == "user" {
+			c := m.Get("content").String()
+			if strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "following skills are available") {
+				userSkillCount++
+			}
+		}
+	}
+
+	// System messages should be: PROMPT (not present) + AGENT (not present) + TASK_PREAMBLE (split result) + INTERRUPT (unknown, kept as last)
+	if sysCount > 3 {
+		t.Fatalf("too many system messages after pipeline: %d\n%s", sysCount, outStr)
+	}
+	if userSkillCount != 1 {
+		t.Fatalf("expected 1 skill listing converted to user, got %d\n%s", userSkillCount, outStr)
+	}
+}
+
+// TestSkillListing_MultiTurnStability simulates 3 consecutive conversation turns
+// to verify the conversion doesn't produce zombies or interfere with pipeline steps.
+func TestSkillListing_MultiTurnStability(t *testing.T) {
+	// Turn 1: first skill listing appears as system message
+	turn1 := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: A dev workflow\n- code-review: Review code"},
+		{"role":"assistant","content":"Hi!"}
+	]}`)
+
+	out1 := ConvertSkillListingToUser(turn1)
+
+	// Verify Turn 1: skill listing converted to user
+	msgs1 := gjson.GetBytes(out1, "messages").Array()
+	if len(msgs1) != 5 {
+		t.Fatalf("turn1: expected 5 msgs, got %d", len(msgs1))
+	}
+	r3 := msgs1[3].Get("role").String()
+	if r3 != "user" {
+		t.Fatalf("turn1 msg[3]: expected user after conversion, got %s", r3)
+	}
+	c3 := msgs1[3].Get("content").String()
+	if !strings.HasPrefix(c3, "<system-reminder>") {
+		t.Fatal("turn1: skill listing should be wrapped")
+	}
+
+	// Turn 2: conversation grew. Old skill listing is now history (user),
+	// CC injects a NEW skill listing (content changed — skill added).
+	turn2 := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"user","content":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- dev-flow: A dev workflow\n- code-review: Review code\n</system-reminder>"},
+		{"role":"assistant","content":"Hi!"},
+		{"role":"user","content":"do code review"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: A dev workflow\n- code-review: Review code\n- deploy: Deploy to production"}
+	]}`)
+
+	out2 := ConvertSkillListingToUser(turn2)
+
+	// Verify Turn 2:
+	msgs2 := gjson.GetBytes(out2, "messages").Array()
+	if len(msgs2) != 7 {
+		t.Fatalf("turn2: expected 7 msgs, got %d", len(msgs2))
+	}
+	// [3] old skill listing — already user, should be UNCHANGED (idempotent)
+	r3_old := msgs2[3].Get("role").String()
+	c3_old := msgs2[3].Get("content").String()
+	if r3_old != "user" {
+		t.Fatalf("turn2 msg[3]: old listing should stay user, got %s", r3_old)
+	}
+	if !strings.HasPrefix(c3_old, "<system-reminder>") {
+		t.Fatal("turn2 msg[3]: old listing wrapper should be preserved")
+	}
+	// Should NOT have double-wrapped
+	if strings.Count(c3_old, "<system-reminder>") > 1 {
+		t.Fatalf("turn2 msg[3]: DOUBLE-WRAPPED! content: %s", c3_old[:200])
+	}
+
+	// [6] new skill listing — should be converted
+	r6 := msgs2[6].Get("role").String()
+	if r6 != "user" {
+		t.Fatalf("turn2 msg[6]: new listing should be user, got %s", r6)
+	}
+	c6 := msgs2[6].Get("content").String()
+	if !strings.HasPrefix(c6, "<system-reminder>") {
+		t.Fatal("turn2 msg[6]: new listing should be wrapped")
+	}
+
+	// Turn 3: no new skill listing injected. Verify stability.
+	turn3 := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"user","content":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- dev-flow: A dev workflow\n- code-review: Review code\n</system-reminder>"},
+		{"role":"assistant","content":"Hi!"},
+		{"role":"user","content":"do code review"},
+		{"role":"user","content":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- dev-flow: A dev workflow\n- code-review: Review code\n- deploy: Deploy to production\n</system-reminder>"},
+		{"role":"assistant","content":"Running code-review..."},
+		{"role":"tool","content":"Review complete: no issues","tool_call_id":"call_1"},
+		{"role":"assistant","content":"Code review done. All good."},
+		{"role":"user","content":"now deploy"}
+	]}`)
+
+	out3 := ConvertSkillListingToUser(turn3)
+
+	// Verify Turn 3: no changes — no system skill listing to convert
+	msgs3 := gjson.GetBytes(out3, "messages").Array()
+	if len(msgs3) != 11 {
+		t.Fatalf("turn3: expected 11 msgs, got %d", len(msgs3))
+	}
+	// [3] and [6] are user-role skill listings from previous turns — should be unchanged
+	for _, idx := range []int{3, 6} {
+		r := msgs3[idx].Get("role").String()
+		if r != "user" {
+			t.Fatalf("turn3 msg[%d]: should stay user, got %s", idx, r)
+		}
+		c := msgs3[idx].Get("content").String()
+		if strings.Count(c, "<system-reminder>") > 1 {
+			t.Fatalf("turn3 msg[%d]: DOUBLE-WRAPPED!", idx)
+		}
+	}
+	// No system skill listing remains
+	for i, m := range msgs3 {
+		if m.Get("role").String() == "system" {
+			c := m.Get("content").String()
+			if strings.HasPrefix(c, skillListPrefix) {
+				t.Fatalf("turn3 msg[%d]: system skill listing not converted!", i)
+			}
+		}
+	}
+}
+
+// TestSkillListing_FullPipelineStability verifies the skill listing conversion
+// doesn't interfere with other pipeline steps across the full CPA pipeline.
+func TestSkillListing_FullPipelineStability(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"user","content":"<system-reminder>\nPreToolUse: Bash hook summary\n</system-reminder>"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate.\n\nHere are the existing tasks:\n\n#1. [in_progress] Fix bug"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: Dev workflow\n- code-review: Review code"},
+		{"role":"assistant","content":"ok"}
+	]}`)
+
+	// Full pipeline: Norm → Dedup → TaskCollapse → SkillConvert → UnknownCollapse
+	out := NormalizePreToolUseMessages(body)
+	out = DeduplicateSystemMessages(out)
+	out = CollapseSystemNotifications(out)
+	out = CollapseTaskReminders(out)
+	out = ConvertSkillListingToUser(out)
+	out = CollapseUnknownSystemMessages(out)
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+
+	// Verify: no system message contains skill listing prefix
+	for i, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "system" && strings.HasPrefix(c, skillListPrefix) {
+			t.Fatalf("msg[%d]: skill listing still system after full pipeline", i)
+		}
+	}
+
+	// Verify: exactly one user message contains the skill listing wrapped in <system-reminder>
+	skillUserCount := 0
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "following skills are available") {
+			skillUserCount++
+		}
+	}
+	if skillUserCount != 1 {
+		t.Fatalf("expected 1 skill listing user message, got %d", skillUserCount)
+	}
+
+	// Verify: Norm step correctly processed the PreToolUse user message
+	hasSystemPTU := false
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "system" && strings.Contains(c, "PreToolUse:") {
+			hasSystemPTU = true
+			break
+		}
+	}
+	if !hasSystemPTU {
+		t.Fatal("PreToolUse should have been normalized to system message")
+	}
+
+	// Verify: Task reminder was converted to <system-reminder> user message
+	hasTaskReminderUser := false
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			hasTaskReminderUser = true
+		}
+	}
+	if !hasTaskReminderUser {
+		t.Fatal("task reminder should be converted to <system-reminder> user message")
+	}
+}
+
+func TestCombinedSplit_NoMessages(t *testing.T) {
+	out := SplitCombinedSystemMessages([]byte(`{}`))
+	if !gjson.ValidBytes(out) {
+		t.Fatal("output should be valid JSON")
+	}
+}
+
+func TestCombinedSplit_NoCombinedMessage(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"You are Claude Code."},
+		{"role":"user","content":"hello"}
+	]}`)
+	out := SplitCombinedSystemMessages(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages, got %d", count)
+	}
+}
+
+func TestCombinedSplit_SplitsCombinedMessage(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill\n- code-review: skill\n\nThe task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status.\n\nHere are the existing tasks:\n\n#1. [completed] Setup\n#2. [in_progress] Fix bug"},
+		{"role":"user","content":"hello"}
+	]}`)
+	out := SplitCombinedSystemMessages(body)
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+
+	// Should have 3 messages: skill(system) + user + task(system appended)
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+
+	// [0] should be skill portion only
+	r0 := msgs[0].Get("role").String()
+	c0 := msgs[0].Get("content").String()
+	if r0 != "system" {
+		t.Fatalf("msg[0] should be system, got %s", r0)
+	}
+	if !strings.HasPrefix(c0, skillListPrefix) {
+		t.Fatalf("msg[0] should start with skill prefix, got: %s", c0[:50])
+	}
+	if strings.Contains(c0, taskListMarker) {
+		t.Fatal("msg[0] should not contain task list marker after split")
+	}
+	if strings.Contains(c0, taskReminderPrefix) {
+		t.Fatal("msg[0] should not contain task reminder after split")
+	}
+
+	// [1] should be unchanged user message
+	r1 := msgs[1].Get("role").String()
+	if r1 != "user" {
+		t.Fatalf("msg[1] should be user, got %s", r1)
+	}
+
+	// [2] should be the task reminder appended at end
+	r2 := msgs[2].Get("role").String()
+	c2 := msgs[2].Get("content").String()
+	if r2 != "system" {
+		t.Fatalf("msg[2] should be system, got %s", r2)
+	}
+	if !strings.HasPrefix(c2, taskReminderPrefix) {
+		t.Fatalf("msg[2] should start with task prefix, got: %s", c2[:50])
+	}
+	if !strings.Contains(c2, taskListMarker) {
+		t.Fatal("msg[2] should contain task list marker")
+	}
+}
+
+func TestCombinedSplit_SkillOnlyUnchanged(t *testing.T) {
+	// Skill listing without task reminder — should pass through unchanged
+	body := []byte(`{"messages":[
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill"},
+		{"role":"user","content":"hello"}
+	]}`)
+	out := SplitCombinedSystemMessages(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("expected 2 messages (unchanged), got %d", count)
+	}
+	c0 := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.HasPrefix(c0, skillListPrefix) {
+		t.Fatal("skill listing should be unchanged")
+	}
+}
+
+func TestCombinedSplit_TaskOnlyUnchanged(t *testing.T) {
+	// Standalone task reminder — should pass through unchanged
+	body := []byte(`{"messages":[
+		{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress.\n\nHere are the existing tasks:\n\n#1. [completed] Setup"},
+		{"role":"user","content":"hello"}
+	]}`)
+	out := SplitCombinedSystemMessages(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("task-only should be unchanged, got %d", count)
+	}
+}
+
+func TestCombinedSplit_Idempotent(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill\n\nThe task tools haven't been used recently. If you're working on tasks.\n\nHere are the existing tasks:\n\n#1. [completed] Setup"},
+		{"role":"user","content":"hello"}
+	]}`)
+
+	first := SplitCombinedSystemMessages(body)
+	second := SplitCombinedSystemMessages(first)
+
+	// Second pass should be no-op: skill portion no longer has taskListMarker
+	if string(first) != string(second) {
+		t.Fatalf("SplitCombinedSystemMessages should be idempotent\nfirst:  %s\nsecond: %s", string(first), string(second))
+	}
+}
+
+func TestCombinedSplit_FullPipelineIntegration(t *testing.T) {
+	// Simulate the full pipeline with a combined message
+	body := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill\n- code-review: skill\n\nThe task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate.\n\nHere are the existing tasks:\n\n#1. [completed] Setup\n#2. [in_progress] Fix bug"},
+		{"role":"system","content":"The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress.\n\nHere are the existing tasks:\n\n#1. [completed] Setup\n#2. [in_progress] Fix bug"},
+		{"role":"assistant","content":"ok"}
+	]}`)
+
+	// Full pipeline: Norm → Dedup → CollapseNotif → SplitCombined → CollapseTask → ConvertSkill → UnknownCollapse
+	out := NormalizePreToolUseMessages(body)
+	out = DeduplicateSystemMessages(out)
+	out = CollapseSystemNotifications(out)
+	out = SplitCombinedSystemMessages(out)
+	out = CollapseTaskReminders(out)
+	out = ConvertSkillListingToUser(out)
+	out = CollapseUnknownSystemMessages(out)
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+
+	// Verify: no system message contains the skill listing prefix
+	for i, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "system" && strings.HasPrefix(c, skillListPrefix) {
+			t.Fatalf("msg[%d]: skill listing still system after full pipeline", i)
+		}
+	}
+
+	// Verify: skill listing converted to user with <system-reminder>
+	skillUserCount := 0
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "following skills are available") {
+			skillUserCount++
+		}
+	}
+	if skillUserCount != 1 {
+		t.Fatalf("expected 1 skill listing user message, got %d", skillUserCount)
+	}
+
+	// Verify: task reminder was converted to <system-reminder> user message
+	hasTaskReminderUser := false
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			hasTaskReminderUser = true
+		}
+	}
+	if !hasTaskReminderUser {
+		t.Fatal("task reminder should be converted to <system-reminder> user message")
+	}
+
+	// Verify: task list contains the correct data (from the combined message's task portion)
+	// Both task reminders have same content in this test, so the collapsed result should have #2
+	if !strings.Contains(string(out), "#2. [in_progress] Fix bug") {
+		t.Fatal("task list should contain #2 from the task reminders")
+	}
+}
+
+func TestCombinedSplit_NonStringContentIgnored(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":[{"type":"text","text":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill\n\nThe task tools haven't been used recently."}]},
+		{"role":"user","content":"hello"}
+	]}`)
+	out := SplitCombinedSystemMessages(body)
+	count := gjson.GetBytes(out, "messages.#").Int()
+	if count != 2 {
+		t.Fatalf("array content should be left unchanged, got %d", count)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func TestCountMessagesByRole(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"prompt"},
+		{"role":"system","content":"agent types"},
+		{"role":"user","content":"hello"},
+		{"role":"assistant","content":"hi"},
+		{"role":"tool","content":"result","tool_call_id":"c1"},
+		{"role":"user","content":"thanks"}
+	]}`)
+	counts := CountMessagesByRole(body)
+	if counts["system"] != 2 {
+		t.Fatalf("expected 2 system, got %d", counts["system"])
+	}
+	if counts["user"] != 2 {
+		t.Fatalf("expected 2 user, got %d", counts["user"])
+	}
+	if counts["assistant"] != 1 {
+		t.Fatalf("expected 1 assistant, got %d", counts["assistant"])
+	}
+	if counts["tool"] != 1 {
+		t.Fatalf("expected 1 tool, got %d", counts["tool"])
+	}
+}
+
+func TestCountMessagesByRole_Empty(t *testing.T) {
+	counts := CountMessagesByRole([]byte(`{}`))
+	if len(counts) != 0 {
+		t.Fatalf("expected empty map, got %v", counts)
+	}
+}
+
+// TestCollapseTask_MultiTurnStability simulates 3 consecutive turns with
+// the convert-to-<system-reminder> approach, verifying:
+//   - Turn 1: first task reminder converted to <system-reminder> user
+//   - Turn 2: new reminder converted; old one stays untouched
+//   - Turn 3: no new reminder → no change; no zombie accumulation
+//   - CC can read taskListMarker from <system-reminder> user messages
+func TestCollapseTask_MultiTurnStability(t *testing.T) {
+	// Turn 1: initial request with 1 task reminder
+	turn1 := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Setup project"}
+	]}`)
+	out1 := CollapseTaskReminders(turn1)
+	msgs1 := gjson.GetBytes(out1, "messages").Array()
+
+	// Verify: 4 messages (prompt + agent + user + converted task)
+	if len(msgs1) != 4 {
+		t.Fatalf("turn1: expected 4 messages, got %d", len(msgs1))
+	}
+	// [3] should be user with <system-reminder> + taskListMarker preserved
+	r3 := msgs1[3].Get("role").String()
+	c3 := msgs1[3].Get("content").String()
+	if r3 != "user" {
+		t.Fatalf("turn1[3]: expected user, got %s", r3)
+	}
+	if !strings.HasPrefix(c3, "<system-reminder>") {
+		t.Fatal("turn1[3]: missing <system-reminder> wrapper")
+	}
+	if !strings.Contains(c3, taskListMarker) {
+		t.Fatal("turn1[3]: taskListMarker must be preserved for CC to read task state")
+	}
+	if !strings.Contains(c3, "Setup project") {
+		t.Fatal("turn1[3]: task content lost")
+	}
+
+	// Turn 2: conversation grew. Old <system-reminder> is in history.
+	// CC injects NEW task reminder with updated state.
+	turn2 := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"user","content":"<system-reminder>\nThe task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Setup project\n</system-reminder>"},
+		{"role":"assistant","content":"hi"},
+		{"role":"user","content":"add feature X"},
+		{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Setup project\n#2. [in_progress] Add feature X"}
+	]}`)
+	out2 := CollapseTaskReminders(turn2)
+	msgs2 := gjson.GetBytes(out2, "messages").Array()
+
+	// Verify: 7 messages (old 6 in history + new converted task at [6])
+	if len(msgs2) != 7 {
+		t.Fatalf("turn2: expected 7 messages, got %d", len(msgs2))
+	}
+	// [3] old task — should still be user with old state
+	r3old := msgs2[3].Get("role").String()
+	c3old := msgs2[3].Get("content").String()
+	if r3old != "user" {
+		t.Fatalf("turn2[3]: old task should stay user, got %s", r3old)
+	}
+	if !strings.Contains(c3old, "Setup project") {
+		t.Fatal("turn2[3]: old task content should be preserved")
+	}
+	if strings.Count(c3old, "<system-reminder>") > 1 {
+		t.Fatal("turn2[3]: DOUBLE-WRAPPED old task message")
+	}
+	// [6] new task — should be user with updated state
+	r6 := msgs2[6].Get("role").String()
+	c6 := msgs2[6].Get("content").String()
+	if r6 != "user" {
+		t.Fatalf("turn2[6]: new task should be user, got %s", r6)
+	}
+	if !strings.Contains(c6, "Add feature X") {
+		t.Fatal("turn2[6]: should have latest task (Add feature X)")
+	}
+	if !strings.Contains(c6, "completed") {
+		t.Fatal("turn2[6]: should reflect completed status")
+	}
+	if !strings.Contains(c6, taskListMarker) {
+		t.Fatal("turn2[6]: taskListMarker must be preserved for CC")
+	}
+
+	// Turn 3: no new task reminder. Body unchanged.
+	turn3 := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"user","content":"<system-reminder>\nThe task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Setup project\n</system-reminder>"},
+		{"role":"assistant","content":"hi"},
+		{"role":"user","content":"add feature X"},
+		{"role":"user","content":"<system-reminder>\nThe task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Setup project\n#2. [in_progress] Add feature X\n</system-reminder>"},
+		{"role":"assistant","content":"working..."},
+		{"role":"user","content":"status?"}
+	]}`)
+	out3 := CollapseTaskReminders(turn3)
+
+	// Turn 3: no system task reminders → body unchanged
+	if string(out3) != string(turn3) {
+		t.Fatalf("turn3: should be unchanged (no system task reminders)\ngot: %s", string(out3))
+	}
+}
+
+// TestCollapseTask_FullPipelineStability verifies the complete CPA pipeline
+// with the new convert approach doesn't break any other step.
+func TestCollapseTask_FullPipelineStability(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"system","content":"Available agent types:\n- claude: catch-all"},
+		{"role":"user","content":"hello"},
+		{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [in_progress] Fix bug\n#2. [pending] Add test"},
+		{"role":"system","content":"The following skills are available for use with the Skill tool:\n\n- dev-flow: skill"},
+		{"role":"system","content":"The user sent a new message while you were working"},
+		{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Fix bug\n#2. [in_progress] Add test\n#3. [pending] Deploy"},
+		{"role":"assistant","content":"ok"}
+	]}`)
+
+	// Full pipeline without Norm (Norm operates on user-role PTU patterns, not tested here)
+	out := DeduplicateSystemMessages(body)
+	out = CollapseSystemNotifications(out)
+	out = CollapseTaskReminders(out)
+	out = ConvertSkillListingToUser(out)
+	out = CollapseUnknownSystemMessages(out)
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+
+	taskUserCount := 0
+	skillUserCount := 0
+	unknownCount := 0
+	taskSysCount := 0
+
+	for _, m := range msgs {
+		r := m.Get("role").String()
+		c := m.Get("content").String()
+
+		// Task: should be <system-reminder> user, NOT system
+		if r == "system" && strings.HasPrefix(c, taskReminderPrefix) {
+			taskSysCount++
+		}
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
+			taskUserCount++
+			if !strings.Contains(c, taskListMarker) {
+				t.Fatalf("task reminder missing taskListMarker: %s", c[:200])
+			}
+			if !strings.Contains(c, "Deploy") {
+				t.Fatalf("should contain latest task (Deploy), got: %s", c[:200])
+			}
+		}
+		// Skill: should be <system-reminder> user
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "following skills are available") {
+			skillUserCount++
+		}
+		// Unknown: should be collapsed to 1 system
+		if r == "system" && strings.HasPrefix(c, "The user sent a new message") {
+			unknownCount++
+		}
+	}
+
+	if taskSysCount != 0 {
+		t.Fatalf("Task: expected 0 system task reminders, got %d", taskSysCount)
+	}
+	if taskUserCount != 1 {
+		t.Fatalf("Task: expected 1 <system-reminder> user task reminder, got %d", taskUserCount)
+	}
+	if skillUserCount != 1 {
+		t.Fatalf("Skill: expected 1 <system-reminder> user skill, got %d", skillUserCount)
+	}
+	if unknownCount != 1 {
+		t.Fatalf("Unknown: expected 1 unknown message (collapsed from 2), got %d", unknownCount)
+	}
+}
+
+// TestCollapseTask_CCScannerCompat verifies that CC task state scanner
+// can find taskListMarker in the converted <system-reminder> user messages.
+// CC's own injection format is <system-reminder> user messages, so its scanner
+// must support reading task state from them.
+func TestCollapseTask_CCScannerCompat(t *testing.T) {
+	// Simulate what CC sees after CPA conversion:
+	// All task reminders are in <system-reminder> user messages with taskListMarker preserved.
+	history := []byte(`{"messages":[
+		{"role":"system","content":"[PROMPT]"},
+		{"role":"user","content":"<system-reminder>\nThe task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Old task\n</system-reminder>"},
+		{"role":"assistant","content":"done"},
+		{"role":"user","content":"<system-reminder>\nThe task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. [completed] Old task\n#2. [in_progress] New task\n</system-reminder>"},
+		{"role":"assistant","content":"working"}
+	]}`)
+
+	// A scanner looking for the LATEST task state should find:
+	// - The last <system-reminder> user message containing taskListMarker
+	// - Should contain the most complete task list (Task #2)
+	msgs := gjson.GetBytes(history, "messages").Array()
+
+	var lastTaskContent string
+	for i := len(msgs) - 1; i >= 0; i-- {
+		r := msgs[i].Get("role").String()
+		c := msgs[i].Get("content").String()
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskListMarker) {
+			lastTaskContent = c
+			break
+		}
+	}
+
+	if lastTaskContent == "" {
+		t.Fatal("CC scanner: should find task state in <system-reminder> user messages")
+	}
+	if !strings.Contains(lastTaskContent, "New task") {
+		t.Fatalf("CC scanner: should find latest task, got: %s", lastTaskContent)
+	}
+	if !strings.Contains(lastTaskContent, "Old task") {
+		t.Fatal("CC scanner: should preserve complete task history")
 	}
 }

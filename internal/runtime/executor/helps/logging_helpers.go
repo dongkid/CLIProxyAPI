@@ -24,6 +24,7 @@ const (
 	apiRequestKey           = "API_REQUEST"
 	apiResponseKey          = "API_RESPONSE"
 	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
+	cpaPipelineDeltaKey     = "CPA_PIPELINE_DELTA"
 	creditsUsedKey          = "__antigravity_credits_used__"
 )
 
@@ -611,4 +612,43 @@ func CreditsUsed(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// FormatCPADelta formats a single CPA pipeline step's role-count delta.
+// before/after are maps from role to count.
+func FormatCPADelta(step string, before, after map[string]int) string {
+	roles := []string{"system", "user", "assistant", "tool"}
+	var parts []string
+	for _, r := range roles {
+		b := before[r]
+		a := after[r]
+		if b == a {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s:%d→%d", r, b, a))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[%s] %s", step, strings.Join(parts, " "))
+}
+
+// AppendCPAPipelineDelta stores a CPA pipeline step delta in ginCtx for
+// inclusion in the v1-messages log. Falls back to logrus debug when the
+// context is not a *gin.Context (e.g. when wrapped by the SDK conductor).
+func AppendCPAPipelineDelta(ctx context.Context, delta string) {
+	if delta == "" {
+		return
+	}
+	ginCtx, ok := ctx.(*gin.Context)
+	if !ok {
+		log.WithField("module", "cpa-delta").Debug(delta)
+		return
+	}
+	existing, _ := ginCtx.Get(cpaPipelineDeltaKey)
+	if existing == nil {
+		ginCtx.Set(cpaPipelineDeltaKey, delta+"\n")
+	} else if s, ok := existing.(string); ok {
+		ginCtx.Set(cpaPipelineDeltaKey, s+delta+"\n")
+	}
 }

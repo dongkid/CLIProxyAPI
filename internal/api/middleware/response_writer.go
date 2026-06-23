@@ -397,13 +397,18 @@ func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time
 }
 
 func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {
-	if body := extractBodyOverride(c, requestBodyOverrideContextKey); len(body) > 0 {
-		return body
+	var body []byte
+	if bodyOverride := extractBodyOverride(c, requestBodyOverrideContextKey); len(bodyOverride) > 0 {
+		body = bodyOverride
+	} else if w.requestInfo != nil && len(w.requestInfo.Body) > 0 {
+		body = bytes.Clone(w.requestInfo.Body)
 	}
-	if w.requestInfo != nil && len(w.requestInfo.Body) > 0 {
-		return w.requestInfo.Body
+	if delta, exists := c.Get("CPA_PIPELINE_DELTA"); exists {
+		if deltaStr, ok := delta.(string); ok && deltaStr != "" {
+			body = append(body, []byte("\n\n=== CPA PIPELINE ===\n"+deltaStr)...)
+		}
 	}
-	return nil
+	return body
 }
 
 func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {

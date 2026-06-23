@@ -194,30 +194,38 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
 	if e.cpaEnabled() {
+		cpaStep := func(name string, body []byte, fn func([]byte) []byte) []byte {
+			before := helps.CountMessagesByRole(body)
+			result := fn(body)
+			after := helps.CountMessagesByRole(result)
+			helps.AppendCPAPipelineDelta(ctx, helps.FormatCPADelta(name, before, after))
+			return result
+		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnablePTUNormalization) {
-			translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm]
+			translated = cpaStep("cpa-norm", translated, helps.NormalizePreToolUseMessages)
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
-			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
+			translated = cpaStep("cpa-dedup", translated, helps.DeduplicateSystemMessages)
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
-			translated = helps.CollapseSystemNotifications(translated)   // [cpa-task-collapse]
-			translated = helps.CollapseTaskReminders(translated)         // [cpa-task-collapse]
-			translated = helps.CollapseUnknownSystemMessages(translated) // [cpa-task-collapse]
+			translated = cpaStep("cpa-task-collapse", translated, helps.CollapseSystemNotifications)
+			translated = cpaStep("cpa-task-collapse", translated, helps.CollapseTaskReminders)
+			translated = cpaStep("cpa-skill-listing", translated, helps.ConvertSkillListingToUser)
+			translated = cpaStep("cpa-task-collapse", translated, helps.CollapseUnknownSystemMessages)
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
-			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
+			translated = cpaStep("cpa-reanchor", translated, helps.ReanchorHooks)
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
-			translated = helps.RelocateHookMessages(translated) // [cpa-reloc]
+			translated = cpaStep("cpa-reloc", translated, helps.RelocateHookMessages)
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
-			translated = helps.SortToolsByName(translated) // [cpa-toolsort]
+			translated = cpaStep("cpa-toolsort", translated, helps.SortToolsByName)
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableReorderJSON) {
-			translated = helps.ReorderJSONForCache(translated) // [cpa-reorder-json]
+			translated = cpaStep("cpa-reorder-json", translated, helps.ReorderJSONForCache)
 		} else if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
-			translated = helps.CanonicalizeJSON(translated) // [cpa-canon]
+			translated = cpaStep("cpa-canon", translated, helps.CanonicalizeJSON)
 		}
 	}
 	if opts.Alt == "responses/compact" {
@@ -457,7 +465,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
 			translated = helps.CollapseSystemNotifications(translated)   // [cpa-task-collapse]
+			translated = helps.SplitCombinedSystemMessages(translated)   // [cpa-combined-split]
 			translated = helps.CollapseTaskReminders(translated)         // [cpa-task-collapse]
+			translated = helps.ConvertSkillListingToUser(translated)     // [cpa-skill-listing]
 			translated = helps.CollapseUnknownSystemMessages(translated) // [cpa-task-collapse]
 		}
 		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {

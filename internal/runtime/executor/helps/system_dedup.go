@@ -106,30 +106,40 @@ const taskReminderPrefix = "The task tools haven't been used recently"
 // inside CC's task reminders.
 const taskListMarker = "\n\nHere are the existing tasks:"
 
-// anchorTag is placed in the system reminder preamble after the task list
-// is extracted, telling the model where to find it.
-const anchorTag = "\n\n[current task list follows in conversation]"
+// skillListPrefix identifies CC-injected skill listing messages that
+// enumerate available skills for the Skill tool. ConvertSkillListingToUser
+// uses it for detection.
+const skillListPrefix = "The following skills are available for use with the Skill tool"
+
+// CountMessagesByRole returns the count of messages per role in body.
+func CountMessagesByRole(body []byte) map[string]int {
+	counts := map[string]int{}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return counts
+	}
+	for _, m := range messages.Array() {
+		r := m.Get("role").String()
+		counts[r]++
+	}
+	return counts
+}
 
 // CollapseTaskReminders collapses multiple Claude Code task reminder
-// system messages into a single message and splits it into two parts:
+// system messages into a single message and converts it to a user message
+// wrapped in <system-reminder> tags.
 //
-//   - The stable preamble stays as a role=system message, keeping its
-//     high attention priority in DeepSeek's system-prompt block.
-//   - The variable task list is extracted into a separate role=user
-//     message, wrapped in [task-list] markers. If a task-list user
-//     message from a previous split already exists its content is
-//     replaced rather than duplicated.
+// CC relies on the task-list marker ("\n\nHere are the existing tasks:") in
+// conversation history to read task state across turns. Previous split-based
+// approaches removed this marker from system messages, breaking CC's ability
+// to track task updates — causing infinite "fix task state" loops.
 //
-// On subsequent requests the split is idempotent: the preamble no
-// longer contains the task-list marker, so splitTaskReminder returns
-// an empty taskList and the function returns without changes.
+// By converting the entire message to a <system-reminder> user message:
+//   - CC retains full access to the task list marker and task state
+//   - The message leaves DeepSeek's system block (syncount stable)
+//   - No content is split or lost
 //
-// This solves the KV cache problem: the system block (preamble only)
-// is now byte-stable across all requests, so the tools section never
-// shifts. The model retains access to both the task-tool prompt
-// (system, high priority) and the current task list (user, stable cache).
-//
-// Logs at debug level when reminders are collapsed or split
+// Logs at debug level when reminders are collapsed or converted
 // [cpa-task-collapse].
 func CollapseTaskReminders(body []byte) []byte {
 	messages := gjson.GetBytes(body, "messages")
@@ -207,91 +217,32 @@ func CollapseTaskReminders(body []byte) []byte {
 	}
 
 	keepContent := outMsgs[keepIdx].Get("content").String()
-	preamble, taskList := splitTaskReminder(keepContent)
-	if taskList == "" {
-		// Already split or no task list marker — idempotent, nothing to do.
-		return out
-	}
 
-	// Replace the system reminder content with the stable preamble + anchor.
-	contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
+	// Convert to user message with <system-reminder> wrapper, preserving
+	// the full content (including task-list marker) so CC can read task state
+	// across turns.
+	wrappedContent := "<system-reminder>\n" + keepContent + "\n</system-reminder>"
+
+	rolePath := fmt.Sprintf("messages.%d.role", keepIdx)
 	var setErr error
-	out, setErr = sjson.SetBytes(out, contentPath, preamble+anchorTag)
+	out, setErr = sjson.SetBytes(out, rolePath, "user")
 	if setErr != nil {
-		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to set preamble for messages.%d: %v", keepIdx, setErr)
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to set role for messages.%d: %v", keepIdx, setErr)
 		return body
 	}
 
-	// Build the user message carrying the variable task list.
-	taskListMsg, err := json.Marshal(map[string]interface{}{
-		"role":    "user",
-		"content": "[task-list]\n" + taskList + "\n[/task-list]",
-	})
-	if err != nil {
-		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to marshal task-list message: %v", err)
-		return body
-	}
-
-	// Scan all task-list user messages from previous splits.
-	// Delete every zombie copy except the last, then replace its content.
-	taskListIdxs := make([]int, 0)
-	for i := len(outMsgs) - 1; i >= 0; i-- {
-		r := outMsgs[i].Get("role").String()
-		c := outMsgs[i].Get("content")
-		if r == "user" && c.Type == gjson.String && strings.HasPrefix(c.String(), "[task-list]") {
-			taskListIdxs = append([]int{i}, taskListIdxs...)
-		}
-	}
-
-	replaced := len(taskListIdxs) > 0
-	if len(taskListIdxs) > 1 {
-		// Delete all but the last zombie copy.
-		zombies := taskListIdxs[:len(taskListIdxs)-1]
-		for i := len(zombies) - 1; i >= 0; i-- {
-			path := fmt.Sprintf("messages.%d", zombies[i])
-			var delErr error
-			out, delErr = sjson.DeleteBytes(out, path)
-			if delErr != nil {
-				log.WithField("module", "system_dedup").Warnf("task-collapse: failed to delete zombie task-list messages.%d: %v", zombies[i], delErr)
-				return body
-			}
-		}
-		log.WithFields(log.Fields{
-			"module":  "system_dedup",
-			"zombies": len(zombies),
-		}).Debug("system_dedup: removed zombie task-list copies [cpa-task-collapse]")
-	}
-
-	// Scan again after deletions to find the surviving task-list index.
-	outMsgs2 := gjson.GetBytes(out, "messages").Array()
-	taskListPath := ""
-	for i := len(outMsgs2) - 1; i >= 0; i-- {
-		if outMsgs2[i].Get("role").String() == "user" {
-			c := outMsgs2[i].Get("content")
-			if c.Type == gjson.String && strings.HasPrefix(c.String(), "[task-list]") {
-				taskListPath = fmt.Sprintf("messages.%d.content", i)
-				break
-			}
-		}
-	}
-
-	if taskListPath != "" {
-		raw := gjson.GetBytes(taskListMsg, "content").Raw
-		out, setErr = sjson.SetRawBytes(out, taskListPath, []byte(raw))
-	} else {
-		out, setErr = sjson.SetRawBytes(out, "messages.-1", taskListMsg)
-	}
+	contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
+	out, setErr = sjson.SetBytes(out, contentPath, wrappedContent)
 	if setErr != nil {
-		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to write task-list message: %v", setErr)
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to wrap content for messages.%d: %v", keepIdx, setErr)
 		return body
 	}
 
 	log.WithFields(log.Fields{
 		"module":         "system_dedup",
-		"sys_at":         keepIdx,
-		"list_extracted": len(taskList),
-		"list_replaced":  replaced,
-	}).Debug("system_dedup: split task reminder into system preamble + user task-list [cpa-task-collapse]")
+		"at":             keepIdx,
+		"original_bytes": len(keepContent),
+	}).Debug("system_dedup: converted task reminder to <system-reminder> user message [cpa-task-collapse]")
 
 	return out
 }
@@ -301,6 +252,10 @@ func CollapseTaskReminders(body []byte) []byte {
 // (without the "Here are the existing tasks:" header). If no task list
 // marker is found, the entire content is returned as preamble and taskList
 // is empty.
+//
+// Deprecated: CollapseTaskReminders now converts the entire message to a
+// <system-reminder> user message instead of splitting. This function is
+// retained for reference but no longer called.
 func splitTaskReminder(content string) (preamble, taskList string) {
 	idx := strings.Index(content, taskListMarker)
 	if idx < 0 {
@@ -312,6 +267,183 @@ func splitTaskReminder(content string) (preamble, taskList string) {
 		return content, ""
 	}
 	return preamble, raw
+}
+
+// SplitCombinedSystemMessages detects CC-injected messages that combine
+// a skill listing and a task reminder into a single system message and
+// splits them into two independent messages so subsequent pipeline steps
+// can handle each piece correctly.
+//
+// CC occasionally merges the skill catalog and the task reminder into one
+// system message that starts with the skill-list prefix but also contains
+// the task-list marker ("\n\nHere are the existing tasks:"). When this
+// happens CollapseTaskReminders misses the message (its prefix check
+// expects "The task tools haven't been used recently") and the task list
+// inside the combined message is lost — the [task-list] user message
+// receives stale data from an earlier standalone task reminder.
+//
+// This function splits the combined message at the task preamble, keeping
+// the skill portion at the original position and appending a separate
+// system message containing the task reminder to the end of the array.
+//
+// After splitting, CollapseTaskReminders can detect the task reminder
+// normally and ConvertSkillListingToUser can handle the skill portion.
+//
+// The split is idempotent: after the first pass the original position
+// no longer contains the task-list marker, so subsequent calls are no-ops.
+//
+// Logs at debug level when a combined message is split [cpa-combined-split].
+func SplitCombinedSystemMessages(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() || len(messages.Array()) == 0 {
+		return body
+	}
+
+	arr := messages.Array()
+	combinedIdx := -1
+	var combinedContent string
+
+	for i := range arr {
+		role := arr[i].Get("role").String()
+		if role != "system" {
+			continue
+		}
+		content := arr[i].Get("content")
+		if content.Type != gjson.String {
+			continue
+		}
+		s := content.String()
+		if strings.HasPrefix(s, skillListPrefix) && strings.Contains(s, taskListMarker) {
+			combinedIdx = i
+			combinedContent = s
+			break
+		}
+	}
+
+	if combinedIdx < 0 {
+		return body
+	}
+
+	// Find the split point: the first occurrence of taskReminderPrefix
+	// after skillListPrefix. The skill portion is everything before it,
+	// the task portion is everything from taskReminderPrefix onward.
+	splitPos := strings.Index(combinedContent, taskReminderPrefix)
+	if splitPos < 0 {
+		return body
+	}
+
+	// Trim trailing whitespace from the skill portion.
+	skillContent := strings.TrimRight(combinedContent[:splitPos], "\n\r ")
+
+	out := body
+	var err error
+
+	// Replace the combined message content with the skill portion only.
+	contentPath := fmt.Sprintf("messages.%d.content", combinedIdx)
+	out, err = sjson.SetBytes(out, contentPath, skillContent)
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("combined-split: failed to replace skill content at messages.%d: %v", combinedIdx, err)
+		return body
+	}
+
+	// Append the task portion as a new system message at the end.
+	taskContent := combinedContent[splitPos:]
+	taskMsg, err := json.Marshal(map[string]interface{}{
+		"role":    "system",
+		"content": taskContent,
+	})
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("combined-split: failed to marshal task message: %v", err)
+		return body
+	}
+	out, err = sjson.SetRawBytes(out, "messages.-1", taskMsg)
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("combined-split: failed to append task message: %v", err)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":      "system_dedup",
+		"at":          combinedIdx,
+		"skill_bytes": len(skillContent),
+		"task_bytes":  len(taskContent),
+	}).Debug("system_dedup: split combined skill+task system message [cpa-combined-split]")
+
+	return out
+}
+
+// ConvertSkillListingToUser converts CC-injected skill listing system messages
+// back to user messages wrapped in <system-reminder> tags, restoring CC's
+// original semantic intent.
+//
+// CC injects skill listings as <system-reminder> user messages, but newer
+// CC versions (2.1.154+) may promote them to role=system. When they reach
+// DeepSeek as system messages they join the system block, incrementing
+// syncount and breaking KV cache alignment.
+//
+// This function detects system messages whose content starts with the
+// skill-list prefix, changes their role to "user", and wraps the content
+// in <system-reminder> tags. The model retains full access to skill
+// descriptions while the message no longer participates in DeepSeek's
+// system block, keeping syncount stable.
+//
+// Unlike CollapseTaskReminders, this function does not split or create
+// additional messages — it performs a single-message in-place conversion
+// with no risk of zombie copies.
+//
+// Logs at debug level when a skill listing is converted [cpa-skill-listing].
+func ConvertSkillListingToUser(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() || len(messages.Array()) == 0 {
+		return body
+	}
+
+	arr := messages.Array()
+	skillIdx := -1
+
+	for i := range arr {
+		role := arr[i].Get("role").String()
+		if role != "system" {
+			continue
+		}
+		content := arr[i].Get("content")
+		if content.Type == gjson.String && strings.HasPrefix(content.String(), skillListPrefix) {
+			skillIdx = i
+			break
+		}
+	}
+
+	if skillIdx < 0 {
+		return body
+	}
+
+	originalContent := arr[skillIdx].Get("content").String()
+	wrappedContent := "<system-reminder>\n" + originalContent + "\n</system-reminder>"
+
+	out := body
+	var err error
+
+	rolePath := fmt.Sprintf("messages.%d.role", skillIdx)
+	out, err = sjson.SetBytes(out, rolePath, "user")
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("skill-listing: failed to set role for messages.%d: %v", skillIdx, err)
+		return body
+	}
+
+	contentPath := fmt.Sprintf("messages.%d.content", skillIdx)
+	out, err = sjson.SetBytes(out, contentPath, wrappedContent)
+	if err != nil {
+		log.WithField("module", "system_dedup").Warnf("skill-listing: failed to set content for messages.%d: %v", skillIdx, err)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":         "system_dedup",
+		"at":             skillIdx,
+		"original_bytes": len(originalContent),
+	}).Debug("system_dedup: converted skill listing system message to <system-reminder> user message [cpa-skill-listing]")
+
+	return out
 }
 
 // sysNotificationPrefix identifies CC background-task completion notifications
@@ -469,7 +601,8 @@ func CollapseUnknownSystemMessages(body []byte) []byte {
 		s := content.String()
 		if strings.HasPrefix(s, "Available agent types") ||
 			strings.HasPrefix(s, taskReminderPrefix) ||
-			strings.HasPrefix(s, sysNotificationPrefix) {
+			strings.HasPrefix(s, sysNotificationPrefix) ||
+			strings.HasPrefix(s, skillListPrefix) {
 			continue
 		}
 		unknownIdxs = append(unknownIdxs, i)
@@ -522,7 +655,8 @@ func isKnownSystemMessage(content gjson.Result) bool {
 	s := content.String()
 	return strings.HasPrefix(s, "Available agent types") ||
 		strings.HasPrefix(s, taskReminderPrefix) ||
-		strings.HasPrefix(s, sysNotificationPrefix)
+		strings.HasPrefix(s, sysNotificationPrefix) ||
+		strings.HasPrefix(s, skillListPrefix)
 }
 
 // AppendEphemeralSystemMessages moves PreToolUse/PostToolUse hook context
