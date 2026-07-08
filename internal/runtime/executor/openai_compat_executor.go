@@ -193,6 +193,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
+
+	// CPA PATCH: inject JSON format constraint for Claude Code /goal stop-hook evaluator.
+	// See https://github.com/anthropics/claude-code/issues/62246
+	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
+		translated, _ = helps.InjectGoalHookConstraint(translated)
+	}
+
 	if e.cpaEnabled() {
 		cpaStep := func(name string, body []byte, fn func([]byte) []byte) []byte {
 			before := helps.CountMessagesByRole(body)
@@ -449,6 +456,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+
+	// CPA PATCH: inject JSON format constraint for Claude Code /goal stop-hook evaluator.
+	// See https://github.com/anthropics/claude-code/issues/62246
+	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
+		translated, _ = helps.InjectGoalHookConstraint(translated)
+	}
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.

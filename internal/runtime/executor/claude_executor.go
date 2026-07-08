@@ -191,6 +191,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
+	// CPA PATCH: inject JSON format constraint for Claude Code /goal stop-hook evaluator.
+	// See https://github.com/anthropics/claude-code/issues/62246
+	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
+		body, _ = helps.InjectGoalHookConstraint(body)
+	}
+
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
@@ -370,6 +376,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
+	}
+
+	// CPA PATCH: inject JSON format constraint for Claude Code /goal stop-hook evaluator.
+	// See https://github.com/anthropics/claude-code/issues/62246
+	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
+		body, _ = helps.InjectGoalHookConstraint(body)
 	}
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)

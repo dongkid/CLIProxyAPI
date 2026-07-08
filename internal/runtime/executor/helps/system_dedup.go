@@ -551,6 +551,34 @@ func CollapseSystemNotifications(body []byte) []byte {
 		}).Debug("system_dedup: normalized notification content [cpa-task-collapse]")
 	}
 
+	// Convert the surviving notification to a <system-reminder> user
+	// message. This keeps the notification out of DeepSeek's system_block,
+	// preventing token-position shifts when CC injects its first
+	// background-task notification mid-session.
+	currentContent := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", keepIdx)).String()
+	wrappedContent := "<system-reminder>\n" + currentContent + "\n</system-reminder>"
+
+	rolePath := fmt.Sprintf("messages.%d.role", keepIdx)
+	var setErr error
+	out, setErr = sjson.SetBytes(out, rolePath, "user")
+	if setErr != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to convert notification role messages.%d: %v", keepIdx, setErr)
+		return body
+	}
+
+	contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
+	out, setErr = sjson.SetBytes(out, contentPath, wrappedContent)
+	if setErr != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to wrap notification content messages.%d: %v", keepIdx, setErr)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":         "system_dedup",
+		"at":             keepIdx,
+		"original_bytes": len(currentContent),
+	}).Debug("system_dedup: converted system notification to <system-reminder> user message [cpa-task-collapse]")
+
 	return out
 }
 
@@ -605,6 +633,9 @@ func CollapseUnknownSystemMessages(body []byte) []byte {
 			strings.HasPrefix(s, skillListPrefix) {
 			continue
 		}
+		if isPTUSystemMessage(arr[i]) {
+			continue
+		}
 		unknownIdxs = append(unknownIdxs, i)
 	}
 
@@ -641,6 +672,35 @@ func CollapseUnknownSystemMessages(body []byte) []byte {
 		"removed": collapsed,
 		"kept":    keepIdx,
 	}).Debug("system_dedup: collapsed unknown system messages [cpa-task-collapse]")
+
+	// The surviving unknown system message was injected by CC and may
+	// change across turns. Convert it to a <system-reminder> user
+	// message so it stays out of DeepSeek's system_block.
+	keepIdxAdjusted := keepIdx - len(removeIdxs)
+
+	currentContent := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", keepIdxAdjusted)).String()
+	wrappedContent := "<system-reminder>\n" + currentContent + "\n</system-reminder>"
+
+	rolePath := fmt.Sprintf("messages.%d.role", keepIdxAdjusted)
+	var setErr error
+	out, setErr = sjson.SetBytes(out, rolePath, "user")
+	if setErr != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to convert unknown message role messages.%d: %v", keepIdxAdjusted, setErr)
+		return body
+	}
+
+	contentPath := fmt.Sprintf("messages.%d.content", keepIdxAdjusted)
+	out, setErr = sjson.SetBytes(out, contentPath, wrappedContent)
+	if setErr != nil {
+		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to wrap unknown message content messages.%d: %v", keepIdxAdjusted, setErr)
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"module":         "system_dedup",
+		"at":             keepIdxAdjusted,
+		"original_bytes": len(currentContent),
+	}).Debug("system_dedup: converted unknown system message to <system-reminder> user message [cpa-task-collapse]")
 
 	return out
 }

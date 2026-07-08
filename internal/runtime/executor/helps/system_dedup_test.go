@@ -436,7 +436,7 @@ func TestCollapseNotif_SingleNotification(t *testing.T) {
 }
 
 func TestCollapseNotif_MultipleNotifications(t *testing.T) {
-	// Multiple → collapsed to 1, then normalized
+	// Multiple → collapsed to 1, normalized, then converted to <system-reminder> user
 	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"start"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"assistant","content":"ok"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>b</task-id>\n</task-notification>"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>c</task-id>\n</task-notification>"}]}`)
 	out := CollapseSystemNotifications(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
@@ -445,8 +445,9 @@ func TestCollapseNotif_MultipleNotifications(t *testing.T) {
 	}
 	notifCount := 0
 	for i := 0; i < int(count); i++ {
+		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if strings.HasPrefix(c, sysNotificationPrefix) {
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, sysNotificationPrefix) {
 			notifCount++
 			if strings.Contains(c, "<task-notification>") {
 				t.Fatalf("XML block should be stripped, got: %s", c)
@@ -454,7 +455,7 @@ func TestCollapseNotif_MultipleNotifications(t *testing.T) {
 		}
 	}
 	if notifCount != 1 {
-		t.Fatalf("expected 1 notification, got %d", notifCount)
+		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifCount)
 	}
 }
 
@@ -486,11 +487,12 @@ func TestCollapseNotif_Idempotent(t *testing.T) {
 	if string(out1) != string(out2) {
 		t.Fatalf("idempotent: bodies differ\npass1: %s\npass2: %s", string(out1), string(out2))
 	}
-	// Verify 1 notification, normalized
+	// Verify notification converted to <system-reminder> user
 	notifCount := 0
 	for i := 0; i < int(c1); i++ {
+		r := gjson.GetBytes(out1, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out1, fmt.Sprintf("messages.%d.content", i)).String()
-		if strings.HasPrefix(c, sysNotificationPrefix) {
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, sysNotificationPrefix) {
 			notifCount++
 			if strings.Contains(c, "<task-notification>") || strings.Contains(c, "tail") {
 				t.Fatalf("notification should be normalized, got: %s", c)
@@ -498,7 +500,7 @@ func TestCollapseNotif_Idempotent(t *testing.T) {
 		}
 	}
 	if notifCount != 1 {
-		t.Fatalf("expected 1 notification, got %d", notifCount)
+		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifCount)
 	}
 }
 
@@ -516,7 +518,7 @@ func TestCollapseNotif_WithTaskReminders(t *testing.T) {
 	for i := 0; i < int(count); i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if strings.HasPrefix(c, sysNotificationPrefix) {
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, sysNotificationPrefix) {
 			notifCount++
 			if strings.Contains(c, "EMBEDDED REMINDER") || strings.Contains(c, "<task-notification>") {
 				t.Fatalf("notification should be normalized (embedded reminder stripped), got: %s", c)
@@ -530,7 +532,7 @@ func TestCollapseNotif_WithTaskReminders(t *testing.T) {
 		}
 	}
 	if notifCount != 1 {
-		t.Fatalf("expected 1 notification, got %d", notifCount)
+		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifCount)
 	}
 	if taskPreambleCount != 1 {
 		t.Fatalf("expected 1 task reminder as <system-reminder> user, got %d", taskPreambleCount)
@@ -538,12 +540,17 @@ func TestCollapseNotif_WithTaskReminders(t *testing.T) {
 }
 
 func TestCollapseNotif_NoMarker(t *testing.T) {
-	// Notification without <task-notification> marker → unchanged
+	// Notification without <task-notification> marker → converted to <system-reminder> user
 	body := []byte(`{"messages":[{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification."},{"role":"user","content":"hi"}]}`)
 	out := CollapseSystemNotifications(body)
+	r := gjson.GetBytes(out, "messages.0.role").String()
+	if r != "user" {
+		t.Fatalf("without marker, role should be converted to user, got: %s", r)
+	}
 	kept := gjson.GetBytes(out, "messages.0.content").String()
-	if kept != "[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification." {
-		t.Fatalf("without marker, content should be unchanged, got: %s", kept)
+	expected := "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification.\n</system-reminder>"
+	if kept != expected {
+		t.Fatalf("without marker, content should be wrapped in <system-reminder>, got: %s", kept)
 	}
 }
 
@@ -573,54 +580,66 @@ func TestCollapseUnknown_Multiple(t *testing.T) {
 	if count != 4 {
 		t.Fatalf("expected 4 messages (3 unknowns collapsed to 1), got %d: %s", count, string(out))
 	}
+	r := gjson.GetBytes(out, "messages.3.role").String()
+	if r != "user" {
+		t.Fatalf("kept should be converted to user, got role=%s", r)
+	}
 	kept := gjson.GetBytes(out, "messages.3.content").String()
+	if !strings.HasPrefix(kept, "<system-reminder>") {
+		t.Fatalf("kept should be wrapped in <system-reminder>, got: %s", kept)
+	}
 	if !strings.Contains(kept, "third") {
 		t.Fatalf("kept should be latest (third), got: %s", kept)
 	}
 }
 
 func TestCollapseUnknown_AllCollapsesTogether(t *testing.T) {
-	// Notif + task reminder + unknown interruption — all three collapses run in order
+	// Notif + task reminder + unknown interruption — all three collapses run in order.
+	// After conversion: all injected messages become <system-reminder> user messages.
 	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"u1"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task A"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Task B"},{"role":"system","content":"The user sent a new message while you were working: pause"},{"role":"system","content":"The user sent a new message while you were working: stop now"},{"role":"assistant","content":"a1"}]}`)
 	out := CollapseSystemNotifications(body)
 	out = CollapseTaskReminders(out)
 	out = CollapseUnknownSystemMessages(out)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	// Verify: 1 notif (system), 1 task reminder (converted to <system-reminder> user), 1 unknown (system), + other msgs
-	notifCount := 0
+	notifUserCount := 0
 	taskUserCount := 0
-	taskSysCount := 0
-	unknownCount := 0
+	unknownUserCount := 0
+	systemCount := 0
 	for i := 0; i < int(count); i++ {
 		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
 		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
 		if r == "system" {
-			if strings.HasPrefix(c, sysNotificationPrefix) {
-				notifCount++
+			systemCount++
+		}
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") {
+			if strings.Contains(c, sysNotificationPrefix) {
+				notifUserCount++
 			}
-			if strings.HasPrefix(c, taskReminderPrefix) {
-				taskSysCount++
+			if strings.Contains(c, taskReminderPrefix) {
+				taskUserCount++
+				if !strings.Contains(c, "Here are the existing tasks") {
+					t.Fatalf("task reminder should preserve task list marker, got: %s", c)
+				}
 			}
-			if strings.HasPrefix(c, "The user sent a new message") {
-				unknownCount++
+			if strings.Contains(c, "The user sent a new message") {
+				unknownUserCount++
+				if !strings.Contains(c, "stop now") {
+					t.Fatalf("unknown should keep latest (stop now), got: %s", c)
+				}
 			}
 		}
-		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
-			taskUserCount++
-		}
 	}
-	_ = count
-	if notifCount != 1 {
-		t.Fatalf("expected 1 notif, got %d", notifCount)
+	if systemCount != 0 {
+		t.Fatalf("expected 0 system messages (all injected messages converted to user), got %d", systemCount)
 	}
-	if taskSysCount != 0 {
-		t.Fatalf("expected 0 task reminders as system (should be converted to user), got %d", taskSysCount)
+	if notifUserCount != 1 {
+		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifUserCount)
 	}
 	if taskUserCount != 1 {
 		t.Fatalf("expected 1 task reminder as <system-reminder> user, got %d", taskUserCount)
 	}
-	if unknownCount != 1 {
-		t.Fatalf("expected 1 unknown, got %d", unknownCount)
+	if unknownUserCount != 1 {
+		t.Fatalf("expected 1 unknown interruption as <system-reminder> user, got %d", unknownUserCount)
 	}
 }
 
@@ -2729,7 +2748,7 @@ func TestCollapseTask_FullPipelineStability(t *testing.T) {
 
 	taskUserCount := 0
 	skillUserCount := 0
-	unknownCount := 0
+	unknownUserCount := 0
 	taskSysCount := 0
 
 	for _, m := range msgs {
@@ -2753,9 +2772,9 @@ func TestCollapseTask_FullPipelineStability(t *testing.T) {
 		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "following skills are available") {
 			skillUserCount++
 		}
-		// Unknown: should be collapsed to 1 system
-		if r == "system" && strings.HasPrefix(c, "The user sent a new message") {
-			unknownCount++
+		// Unknown: should be converted to <system-reminder> user
+		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, "The user sent a new message") {
+			unknownUserCount++
 		}
 	}
 
@@ -2768,8 +2787,8 @@ func TestCollapseTask_FullPipelineStability(t *testing.T) {
 	if skillUserCount != 1 {
 		t.Fatalf("Skill: expected 1 <system-reminder> user skill, got %d", skillUserCount)
 	}
-	if unknownCount != 1 {
-		t.Fatalf("Unknown: expected 1 unknown message (collapsed from 2), got %d", unknownCount)
+	if unknownUserCount != 1 {
+		t.Fatalf("Unknown: expected 1 <system-reminder> user unknown message (collapsed from 2), got %d", unknownUserCount)
 	}
 }
 

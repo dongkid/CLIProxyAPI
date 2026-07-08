@@ -426,6 +426,13 @@ type PayloadModelRule struct {
 	// SupportsMultimodal indicates whether the model supports multimodal inputs (images, files, etc.).
 	// nil = no filtering (default), false = strip multimodal content, true = explicitly supports.
 	SupportsMultimodal *bool `yaml:"supports-multimodal" json:"supports_multimodal"`
+
+	// CCGoalHook enables Claude Code /goal stop-hook evaluator JSON constraint injection.
+	// When true, CPA detects goal-hook evaluation requests and injects stronger JSON formatting
+	// instructions into the system prompt to prevent non-JSON output from the evaluator model.
+	// This addresses upstream issue: https://github.com/anthropics/claude-code/issues/62246
+	// nil = disabled (default), true = enabled for matching models.
+	CCGoalHook *bool `yaml:"cc-goal-hook,omitempty" json:"cc_goal_hook,omitempty"`
 }
 
 // CloakConfig configures request cloaking for non-Claude-Code clients.
