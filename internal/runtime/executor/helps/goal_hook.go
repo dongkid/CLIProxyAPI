@@ -16,6 +16,7 @@ import (
 // See: https://github.com/anthropics/claude-code/issues/62246
 const ccGoalHookSystemPrompt = `CRITICAL OUTPUT FORMAT REQUIREMENT - Your response MUST be a raw JSON object ONLY:
 
+- DO NOT use any tools or functions
 - NO markdown code fences (do NOT wrap in json code blocks)
 - NO explanatory text before or after the JSON
 - NO additional commentary, headings, or formatting
@@ -46,8 +47,8 @@ func IsCCGoalHookEnabled(cfg *config.Config, model string) bool {
 	candidates := payloadModelCandidates(model, "")
 	rules := collectCCGoalHookRules(cfg)
 	log.WithFields(log.Fields{
-		"model":      model,
-		"candidates": candidates,
+		"model":       model,
+		"candidates":  candidates,
 		"rules_found": len(rules),
 	}).Info("[cc-goal-hook] IsCCGoalHookEnabled check")
 	for _, candidate := range candidates {
@@ -146,6 +147,8 @@ func scanBodyForGoalHookDetectPhrase(body []byte) (found bool, isTopLevelSystem 
 
 // InjectGoalHookConstraint detects goal-hook evaluation requests in the body and
 // injects a stronger JSON formatting constraint into the system prompt.
+// Also sets tool_choice to "none" to prevent the model from calling tools
+// instead of outputting raw JSON.
 // Returns the (possibly modified) body and a boolean indicating whether injection occurred.
 func InjectGoalHookConstraint(body []byte) ([]byte, bool) {
 	if !gjson.ValidBytes(body) {
@@ -157,8 +160,8 @@ func InjectGoalHookConstraint(body []byte) ([]byte, bool) {
 	found, isTopLevel := scanBodyForGoalHookDetectPhrase(body)
 	if !found {
 		log.WithFields(log.Fields{
-			"has_system":  gjson.GetBytes(body, "system").Exists(),
-			"first_role":  gjson.GetBytes(body, "messages.0.role").String(),
+			"has_system": gjson.GetBytes(body, "system").Exists(),
+			"first_role": gjson.GetBytes(body, "messages.0.role").String(),
 		}).Info("[cc-goal-hook] goal hook phrase not found in body")
 		return body, false
 	}
@@ -192,10 +195,10 @@ func InjectGoalHookConstraint(body []byte) ([]byte, bool) {
 		}).Info("[cc-goal-hook] injected into top-level system array")
 	} else {
 		// Inject into messages[0].content array (system role message).
-		contentArr := gjson.GetBytes(body, "messages.0.content")
+		contentVal := gjson.GetBytes(body, "messages.0.content")
 		textBlockCount := 0
-		if contentArr.IsArray() {
-			contentArr.ForEach(func(_, part gjson.Result) bool {
+		if contentVal.IsArray() {
+			contentVal.ForEach(func(_, part gjson.Result) bool {
 				if part.Get("type").String() == "text" {
 					textBlockCount++
 				}
@@ -204,6 +207,18 @@ func InjectGoalHookConstraint(body []byte) ([]byte, bool) {
 		}
 
 		var err error
+		// sjson -1 append corrupts string values, so convert string content
+		// to an array of content blocks first.
+		if contentVal.Type == gjson.String {
+			textBlockCount = 1
+			body, err = sjson.SetBytes(body, "messages.0.content",
+				[]any{map[string]any{"type": "text", "text": contentVal.String()}})
+			if err != nil {
+				log.WithError(err).Warn("[cc-goal-hook] failed to convert messages[0].content to array")
+				return body, false
+			}
+		}
+
 		body, err = sjson.SetBytes(body, "messages.0.content.-1", map[string]any{
 			"type": "text",
 			"text": ccGoalHookSystemPrompt,
@@ -216,6 +231,16 @@ func InjectGoalHookConstraint(body []byte) ([]byte, bool) {
 			"text_block_count": textBlockCount,
 		}).Info("[cc-goal-hook] injected into messages[0].content")
 	}
+
+	// Disable tool calling so the model outputs raw JSON instead of
+	// continuing to use tools from conversation context.
+	var err error
+	body, err = sjson.SetBytes(body, "tool_choice", "none")
+	if err != nil {
+		log.WithError(err).Warn("[cc-goal-hook] failed to set tool_choice=none")
+		return body, false
+	}
+	log.Info("[cc-goal-hook] set tool_choice=none")
 
 	return body, true
 }

@@ -78,13 +78,33 @@ func TestInjectGoalHookConstraint_NotGoalHook(t *testing.T) {
 	if string(result) != string(body) {
 		t.Error("expected body unchanged for non-goal-hook request")
 	}
+	if gjson.GetBytes(result, "tool_choice").Exists() {
+		t.Error("expected no tool_choice for non-goal-hook request")
+	}
+}
+
+func TestInjectGoalHookConstraint_NotGoalHook_WithTools(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"tools":[{"function":{"name":"test_tool","description":"a test tool"}}]}`)
+	result, injected := InjectGoalHookConstraint(body)
+	if injected {
+		t.Error("expected false for non-goal-hook request")
+	}
+	if string(result) != string(body) {
+		t.Error("expected body unchanged for non-goal-hook request")
+	}
+	if gjson.GetBytes(result, "tool_choice").Exists() {
+		t.Error("expected no tool_choice for non-goal-hook request, tools should be unaffected")
+	}
+	if !gjson.GetBytes(result, "tools").Exists() {
+		t.Error("expected tools section to be preserved for non-goal-hook request")
+	}
 }
 
 func TestInjectGoalHookConstraint_GoalHookRequest(t *testing.T) {
 	body := []byte(`{"system":[{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},{"type":"text","text":"You are evaluating a stop-condition hook in Claude Code."}],"messages":[]}`)
 	result, injected := InjectGoalHookConstraint(body)
 	if !injected {
-		t.Error("expected true for goal-hook request")
+		t.Fatal("expected true for goal-hook request")
 	}
 	system := gjson.GetBytes(result, "system")
 	if !system.IsArray() {
@@ -101,6 +121,43 @@ func TestInjectGoalHookConstraint_GoalHookRequest(t *testing.T) {
 	text := last.Get("text").String()
 	if text != ccGoalHookSystemPrompt {
 		t.Errorf("expected injected prompt, got:\n%s", text)
+	}
+	if gjson.GetBytes(result, "tool_choice").String() != "none" {
+		t.Error("expected tool_choice to be 'none'")
+	}
+}
+
+func TestInjectGoalHookConstraint_GoalHookRequest_StringContent(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"You are evaluating a stop-condition hook in Claude Code."}]}`)
+	result, injected := InjectGoalHookConstraint(body)
+	if !injected {
+		t.Fatal("expected true for goal-hook request")
+	}
+	content := gjson.GetBytes(result, "messages.0.content")
+	if !content.IsArray() {
+		t.Fatal("expected messages[0].content to be an array")
+	}
+	arr := content.Array()
+	if len(arr) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(arr))
+	}
+	if arr[0].Get("type").String() != "text" {
+		t.Errorf("expected first block type text, got %s", arr[0].Get("type").String())
+	}
+	if arr[0].Get("text").String() != "You are evaluating a stop-condition hook in Claude Code." {
+		t.Errorf("expected original text preserved, got: %s", arr[0].Get("text").String())
+	}
+	if arr[1].Get("type").String() != "text" {
+		t.Errorf("expected second block type text, got %s", arr[1].Get("type").String())
+	}
+	if arr[1].Get("text").String() != ccGoalHookSystemPrompt {
+		t.Errorf("expected injected prompt, got:\n%s", arr[1].Get("text").String())
+	}
+	if !gjson.ValidBytes(result) {
+		t.Error("result must be valid JSON")
+	}
+	if gjson.GetBytes(result, "tool_choice").String() != "none" {
+		t.Error("expected tool_choice to be 'none'")
 	}
 }
 

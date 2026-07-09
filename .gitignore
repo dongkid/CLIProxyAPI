@@ -63,3 +63,4 @@ test*
 linshi/*
 cli-proxy-api.exe~
 goal-hook-prompt-structure.html
+debug/*
