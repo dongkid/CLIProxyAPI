@@ -20,6 +20,11 @@ import (
 //
 // This must run BEFORE getRequestDetailsWithOptions so the new model
 // determines the provider/auth/upstream selection path.
+//
+// NOTE: max_tokens override only happens when a redirect actually occurred.
+// For models with cc-auto-mode (no redirect), the executor-level
+// ApplyCCAutoMode handles overrides AFTER verifying isAutoModeClassifier.
+// This prevents accidental max_tokens override on non-classifier requests.
 func (h *BaseAPIHandler) maybeRedirectAutoMode(rawJSON []byte, modelName string) (newModel string, newBody []byte) {
 	newModel = modelName
 	newBody = rawJSON
@@ -30,14 +35,17 @@ func (h *BaseAPIHandler) maybeRedirectAutoMode(rawJSON []byte, modelName string)
 
 	// Step 1: Detect classifier and apply redirect.
 	redirectModel, ok := h.AuthManager.CheckAutoModeRedirect(rawJSON, modelName)
-	if ok {
-		newModel = redirectModel
-		newBody, _ = sjson.SetBytes(rawJSON, "model", redirectModel)
+	if !ok {
+		// Not a classifier or no redirect configured.
+		// Executor-level ApplyCCAutoMode will handle overrides if needed.
+		return
 	}
+	newModel = redirectModel
+	newBody, _ = sjson.SetBytes(rawJSON, "model", redirectModel)
 
 	// Step 2: Inject max_tokens (valid in both Claude and OpenAI formats).
-	// reasoning_effort is NOT set here — it's not a Claude format field and
-	// may cause translation errors. The executor handles it after translation.
+	// Only runs when redirect occurred (implies classifier was detected).
+	// reasoning_effort is NOT set here — it's not a Claude format field.
 	if maxTokens, _ := h.AuthManager.GetAutoModeOverrides(newModel); maxTokens > 0 {
 		cur := int(gjson.GetBytes(newBody, "max_tokens").Int())
 		if cur != maxTokens {
