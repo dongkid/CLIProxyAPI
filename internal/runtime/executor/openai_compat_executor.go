@@ -199,13 +199,24 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
-	// CPA PATCH: inject max_tokens and cap reasoning effort for Claude Code auto
-	// mode classifier requests. The classifier's default 2112 max_tokens is
-	// insufficient for the ~48KB system prompt and multi-rule analysis, causing
-	// the model to exhaust its budget on reasoning without outputting a verdict.
+	// CPA PATCH: handle Claude Code auto mode classifier requests.
+	// Detects auto mode classifier by its system prompt, optionally redirects
+	// to a different model, and applies max_tokens / reasoning_effort overrides
+	// from the target model's cc-auto-mode configuration.
 	if helps.IsCCAutoModeEnabled(e.cfg, baseModel) {
-		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, baseModel)
-		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens)
+		redirectModel := helps.GetCCAutoModeRedirect(e.cfg, baseModel)
+		targetModel := baseModel
+		if redirectModel != "" && redirectModel != baseModel {
+			translated, _ = sjson.SetBytes(translated, "model", redirectModel)
+			log.WithFields(log.Fields{
+				"from": baseModel,
+				"to":   redirectModel,
+			}).Info("[cc-auto-mode] classifier redirected to model")
+			targetModel = redirectModel
+		}
+		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, targetModel)
+		reasoningEffort := helps.GetCCAutoModeReasoningEffort(e.cfg, targetModel)
+		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens, reasoningEffort)
 	}
 
 	if e.cpaEnabled() {
@@ -470,13 +481,24 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
-	// CPA PATCH: inject max_tokens and cap reasoning effort for Claude Code auto
-	// mode classifier requests. The classifier's default 2112 max_tokens is
-	// insufficient for the ~48KB system prompt and multi-rule analysis, causing
-	// the model to exhaust its budget on reasoning without outputting a verdict.
+	// CPA PATCH: handle Claude Code auto mode classifier requests.
+	// Detects auto mode classifier by its system prompt, optionally redirects
+	// to a different model, and applies max_tokens / reasoning_effort overrides
+	// from the target model's cc-auto-mode configuration.
 	if helps.IsCCAutoModeEnabled(e.cfg, baseModel) {
-		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, baseModel)
-		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens)
+		redirectModel := helps.GetCCAutoModeRedirect(e.cfg, baseModel)
+		targetModel := baseModel
+		if redirectModel != "" && redirectModel != baseModel {
+			translated, _ = sjson.SetBytes(translated, "model", redirectModel)
+			log.WithFields(log.Fields{
+				"from": baseModel,
+				"to":   redirectModel,
+			}).Info("[cc-auto-mode] classifier redirected to model")
+			targetModel = redirectModel
+		}
+		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, targetModel)
+		reasoningEffort := helps.GetCCAutoModeReasoningEffort(e.cfg, targetModel)
+		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens, reasoningEffort)
 	}
 
 	// Request usage data in the final streaming chunk so that token statistics

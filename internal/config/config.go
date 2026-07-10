@@ -450,8 +450,21 @@ type PayloadModelRule struct {
 	CCAutoMode *bool `yaml:"cc-auto-mode,omitempty" json:"cc_auto_mode,omitempty"`
 
 	// CCAutoModeMaxTokens sets the max_tokens value for auto mode classifier
-	// requests when CCAutoMode is enabled. If not set, defaults to 8192.
+	// requests when CCAutoMode is enabled. When set (>0), overrides the
+	// classifier's max_tokens. When nil, leaves the original value unchanged.
 	CCAutoModeMaxTokens *int `yaml:"cc-auto-mode-max-tokens,omitempty" json:"cc_auto_mode_max_tokens,omitempty"`
+
+	// CCAutoModeRedirect redirects auto mode classifier requests to a different
+	// model for safety analysis. When set, overrides the "model" field in the
+	// request body. Parameters (max_tokens, reasoning_effort) are then resolved
+	// against the target model's cc-auto-mode configuration.
+	CCAutoModeRedirect *string `yaml:"cc-auto-mode-redirect,omitempty" json:"cc_auto_mode_redirect,omitempty"`
+
+	// CCAutoModeReasoningEffort sets the reasoning effort for auto mode classifier
+	// requests when CCAutoMode is enabled. When set (non-empty), overrides both
+	// "reasoning_effort" and "reasoning.effort" in the request body. When nil,
+	// leaves the existing effort value unchanged (e.g. from ApplyPayloadConfig).
+	CCAutoModeReasoningEffort *string `yaml:"cc-auto-mode-reasoning-effort,omitempty" json:"cc_auto_mode_reasoning_effort,omitempty"`
 }
 
 // CloakConfig configures request cloaking for non-Claude-Code clients.
