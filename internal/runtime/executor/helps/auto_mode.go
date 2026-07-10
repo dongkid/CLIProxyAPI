@@ -289,13 +289,23 @@ func InjectAutoModeOverrides(body []byte, maxTokens int, reasoningEffort string)
 //
 // The handler-level redirect (handlers.go:maybeRedirectAutoMode) handles model
 // routing and max_tokens in Claude format. This function is a belt-and-suspenders
-// layer that also operates on the translated body. It reads the client-facing
-// model name from originalBody (the handler-modified raw JSON, containing the
-// alias) for config lookup, since baseModel at this point is the upstream name
-// which would not match cc-auto-mode rules.
+// layer that ALSO checks isAutoModeClassifier before applying — it only acts
+// on actual classifier requests, not on normal chat requests that happen to
+// use a model with cc-auto-mode enabled.
+//
+// It reads the client-facing model name from originalBody (the handler-modified
+// raw JSON, containing the alias) for config lookup, since baseModel at this
+// point is the upstream name which would not match cc-auto-mode rules.
 //
 // Returns the (possibly modified) body.
 func ApplyCCAutoMode(body []byte, cfg *config.Config, originalBody []byte) []byte {
+	// CRITICAL: Only apply overrides to actual classifier requests.
+	// Without this check, ALL requests for a model with cc-auto-mode
+	// configured would get their max_tokens and reasoning_effort overridden.
+	if !isAutoModeClassifier(body) {
+		return body
+	}
+
 	// Extract client-facing model name from original body for config lookup.
 	lookupModel := ""
 	if len(originalBody) > 0 {
