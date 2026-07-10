@@ -440,6 +440,13 @@ nonstream-keepalive-interval: 0
 #             - "metadata.disable_payload"
 #           supports-multimodal: false # optional: when false, images/files are replaced with a notice
 #           cc-goal-hook: true # CPA patch: when true, injects JSON format constraint for Claude Code /goal evaluator
+#           cc-auto-mode: true # CPA patch: when true, overrides max_tokens and caps reasoning effort for
+#                              # Claude Code auto mode safety classifier requests. This runs AFTER
+#                              # ApplyPayloadConfig, so if you configure reasoning.effort: max for your
+#                              # model below, the classifier request will have its effort capped to "high"
+#                              # — giving your main sessions maximum reasoning while keeping classifier
+#                              # responses fast and reliable.
+#           cc-auto-mode-max-tokens: 8192 # optional: max_tokens value for classifier (default 8192)
 #       params: # JSON path (gjson/sjson syntax) -> value
 #         "generationConfig.thinkingConfig.thinkingBudget": 32768
 #   default-raw: # Default raw rules set parameters using raw JSON when missing (must be valid JSON).

@@ -199,6 +199,14 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
+	// CPA PATCH: inject max_tokens and cap reasoning effort for Claude Code auto
+	// mode classifier requests. The classifier's default 2112 max_tokens is
+	// insufficient for the ~48KB system prompt and multi-rule analysis, causing
+	// the model to exhaust its budget on reasoning without outputting a verdict.
+	if helps.IsCCAutoModeEnabled(e.cfg, baseModel) {
+		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, baseModel)
+		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens)
+	}
 
 	if e.cpaEnabled() {
 		cpaStep := func(name string, body []byte, fn func([]byte) []byte) []byte {
@@ -461,6 +469,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// See https://github.com/anthropics/claude-code/issues/62246
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
+	}
+	// CPA PATCH: inject max_tokens and cap reasoning effort for Claude Code auto
+	// mode classifier requests. The classifier's default 2112 max_tokens is
+	// insufficient for the ~48KB system prompt and multi-rule analysis, causing
+	// the model to exhaust its budget on reasoning without outputting a verdict.
+	if helps.IsCCAutoModeEnabled(e.cfg, baseModel) {
+		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, baseModel)
+		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens)
 	}
 
 	// Request usage data in the final streaming chunk so that token statistics

@@ -433,6 +433,25 @@ type PayloadModelRule struct {
 	// This addresses upstream issue: https://github.com/anthropics/claude-code/issues/62246
 	// nil = disabled (default), true = enabled for matching models.
 	CCGoalHook *bool `yaml:"cc-goal-hook,omitempty" json:"cc_goal_hook,omitempty"`
+
+	// CCAutoMode enables Claude Code auto mode classifier request overrides.
+	// When true, CPA detects auto mode safety classifier requests (by the
+	// "security monitor for autonomous AI coding agents" system prompt phrase)
+	// and injects:
+	//   - Increased max_tokens to give the classifier enough budget for
+	//     complete reasoning + verdict output (default 8192, configurable
+	//     via CCAutoModeMaxTokens).
+	//   - Capped reasoning effort at "high" to prevent user-configured
+	//     "max" effort from consuming excessive tokens unnecessarily.
+	// This addresses the stability issue where the classifier's default
+	// 2112 max_tokens is insufficient for the ~48KB system prompt and
+	// multi-rule safety analysis.
+	// nil = disabled (default), true = enabled for matching models.
+	CCAutoMode *bool `yaml:"cc-auto-mode,omitempty" json:"cc_auto_mode,omitempty"`
+
+	// CCAutoModeMaxTokens sets the max_tokens value for auto mode classifier
+	// requests when CCAutoMode is enabled. If not set, defaults to 8192.
+	CCAutoModeMaxTokens *int `yaml:"cc-auto-mode-max-tokens,omitempty" json:"cc_auto_mode_max_tokens,omitempty"`
 }
 
 // CloakConfig configures request cloaking for non-Claude-Code clients.
