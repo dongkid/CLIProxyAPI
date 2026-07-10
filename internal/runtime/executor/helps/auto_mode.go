@@ -284,6 +284,67 @@ func InjectAutoModeOverrides(body []byte, maxTokens int, reasoningEffort string)
 	return body, modified
 }
 
+// ApplyCCAutoMode applies cc-auto-mode overrides (max_tokens + reasoning_effort)
+// to the translated request body at the executor level.
+//
+// The handler-level redirect (handlers.go:maybeRedirectAutoMode) handles model
+// routing and max_tokens in Claude format. This function is a belt-and-suspenders
+// layer that also operates on the translated body. It reads the client-facing
+// model name from originalBody (the handler-modified raw JSON, containing the
+// alias) for config lookup, since baseModel at this point is the upstream name
+// which would not match cc-auto-mode rules.
+//
+// Returns the (possibly modified) body.
+func ApplyCCAutoMode(body []byte, cfg *config.Config, originalBody []byte) []byte {
+	// Extract client-facing model name from original body for config lookup.
+	lookupModel := ""
+	if len(originalBody) > 0 {
+		lookupModel = gjson.GetBytes(originalBody, "model").String()
+	}
+	if lookupModel == "" {
+		return body
+	}
+	if !IsCCAutoModeEnabled(cfg, lookupModel) {
+		return body
+	}
+
+	var modified bool
+
+	// 1. Override max_tokens as a safety net (handler already set it in Claude
+	// format, but translation might have altered it).
+	if mt := GetCCAutoModeMaxTokens(cfg, lookupModel); mt > 0 {
+		cur := int(gjson.GetBytes(body, "max_tokens").Int())
+		if cur != mt {
+			body, _ = sjson.SetBytes(body, "max_tokens", mt)
+			log.WithFields(log.Fields{
+				"model": lookupModel,
+				"from":  cur,
+				"to":    mt,
+			}).Info("[cc-auto-mode] max_tokens override at executor level")
+			modified = true
+		}
+	}
+
+	// 2. Override reasoning_effort (only possible in OpenAI format,
+	// not in the Claude format that the handler works with).
+	if effort := GetCCAutoModeReasoningEffort(cfg, lookupModel); effort != "" {
+		body, _ = sjson.SetBytes(body, "reasoning_effort", effort)
+		body, _ = sjson.SetBytes(body, "reasoning.effort", effort)
+		log.WithFields(log.Fields{
+			"model":  lookupModel,
+			"effort": effort,
+		}).Info("[cc-auto-mode] reasoning_effort override at executor level")
+		modified = true
+	}
+
+	if modified {
+		log.WithFields(log.Fields{
+			"model": lookupModel,
+		}).Debug("[cc-auto-mode] overrides applied at executor level")
+	}
+	return body
+}
+
 // setEffortField sets a reasoning effort field to the specified value.
 func setEffortField(body []byte, path string, value string, modified *bool) []byte {
 	current := gjson.GetBytes(body, path).String()

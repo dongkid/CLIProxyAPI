@@ -199,25 +199,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
-	// CPA PATCH: handle Claude Code auto mode classifier requests.
-	// Detects auto mode classifier by its system prompt, optionally redirects
-	// to a different model, and applies max_tokens / reasoning_effort overrides
-	// from the target model's cc-auto-mode configuration.
-	if helps.IsCCAutoModeEnabled(e.cfg, baseModel) {
-		redirectModel := helps.GetCCAutoModeRedirect(e.cfg, baseModel)
-		targetModel := baseModel
-		if redirectModel != "" && redirectModel != baseModel {
-			translated, _ = sjson.SetBytes(translated, "model", redirectModel)
-			log.WithFields(log.Fields{
-				"from": baseModel,
-				"to":   redirectModel,
-			}).Info("[cc-auto-mode] classifier redirected to model")
-			targetModel = redirectModel
-		}
-		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, targetModel)
-		reasoningEffort := helps.GetCCAutoModeReasoningEffort(e.cfg, targetModel)
-		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens, reasoningEffort)
-	}
+	// CPA PATCH: apply auto mode overrides at executor level (belt over handler's suspenders).
+	// Handler already handles redirect + max_tokens in Claude format.
+	// This uses opts.OriginalRequest (handler-modified, contains alias) for config lookup
+	// because baseModel at this point is the upstream name and wouldn't match rules.
+	translated = helps.ApplyCCAutoMode(translated, e.cfg, opts.OriginalRequest)
 
 	if e.cpaEnabled() {
 		cpaStep := func(name string, body []byte, fn func([]byte) []byte) []byte {
@@ -481,25 +467,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
-	// CPA PATCH: handle Claude Code auto mode classifier requests.
-	// Detects auto mode classifier by its system prompt, optionally redirects
-	// to a different model, and applies max_tokens / reasoning_effort overrides
-	// from the target model's cc-auto-mode configuration.
-	if helps.IsCCAutoModeEnabled(e.cfg, baseModel) {
-		redirectModel := helps.GetCCAutoModeRedirect(e.cfg, baseModel)
-		targetModel := baseModel
-		if redirectModel != "" && redirectModel != baseModel {
-			translated, _ = sjson.SetBytes(translated, "model", redirectModel)
-			log.WithFields(log.Fields{
-				"from": baseModel,
-				"to":   redirectModel,
-			}).Info("[cc-auto-mode] classifier redirected to model")
-			targetModel = redirectModel
-		}
-		maxTokens := helps.GetCCAutoModeMaxTokens(e.cfg, targetModel)
-		reasoningEffort := helps.GetCCAutoModeReasoningEffort(e.cfg, targetModel)
-		translated, _ = helps.InjectAutoModeOverrides(translated, maxTokens, reasoningEffort)
-	}
+	// CPA PATCH: apply auto mode overrides at executor level (belt over handler's suspenders).
+	// Handler already handles redirect + max_tokens in Claude format.
+	// This uses opts.OriginalRequest (handler-modified, contains alias) for config lookup
+	// because baseModel at this point is the upstream name and wouldn't match rules.
+	translated = helps.ApplyCCAutoMode(translated, e.cfg, opts.OriginalRequest)
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
