@@ -290,12 +290,13 @@ func InjectAutoModeOverrides(body []byte, maxTokens int, reasoningEffort string)
 // The handler-level redirect (handlers.go:maybeRedirectAutoMode) handles model
 // routing and max_tokens in Claude format. This function is a belt-and-suspenders
 // layer that ALSO checks isAutoModeClassifier before applying — it only acts
-// on actual classifier requests, not on normal chat requests that happen to
-// use a model with cc-auto-mode enabled.
+// on actual classifier requests, not on normal chat requests.
 //
-// It reads the client-facing model name from originalBody (the handler-modified
-// raw JSON, containing the alias) for config lookup, since baseModel at this
-// point is the upstream name which would not match cc-auto-mode rules.
+// It reads the model name from originalBody (raw JSON as modified by the handler;
+// after a redirect this is the TARGET model's client-facing name, e.g.
+// "step-3.7-flash-free") for config lookup. This is necessary because baseModel
+// at this point is the upstream name (e.g. "stepfun-ai/step-3.7-flash") which
+// would not match cc-auto-mode rules (they use client-facing names).
 //
 // Returns the (possibly modified) body.
 func ApplyCCAutoMode(body []byte, cfg *config.Config, originalBody []byte) []byte {

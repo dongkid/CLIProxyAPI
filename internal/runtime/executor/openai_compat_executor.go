@@ -188,7 +188,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	translated = helps.RestoreDeepSeekReasoningEffort(translated, baseModel, originalEffort)
-	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -199,11 +198,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
-	// CPA PATCH: apply auto mode overrides at executor level (belt over handler's suspenders).
-	// Handler already handles redirect + max_tokens in Claude format.
-	// This uses opts.OriginalRequest (handler-modified, contains alias) for config lookup
-	// because baseModel at this point is the upstream name and wouldn't match rules.
+	// CPA PATCH: apply auto mode overrides at executor level.
+	// Handler already handled redirect + max_tokens. opts.OriginalRequest at this
+	// point has model=redirectTarget (client-facing name, matches config rules).
+	// baseModel is the upstream name which wouldn't match the rules.
 	translated = helps.ApplyCCAutoMode(translated, e.cfg, opts.OriginalRequest)
+	// Ensure reasoning_content exists in assistant messages when reasoning_effort is set.
+	// Must run AFTER ApplyCCAutoMode (which may set reasoning_effort), otherwise
+	// EnsureReasoningContentInAssistantMessages would skip due to missing reasoning_effort.
+	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 
 	if e.cpaEnabled() {
 		cpaStep := func(name string, body []byte, fn func([]byte) []byte) []byte {
@@ -467,10 +470,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if helps.IsCCGoalHookEnabled(e.cfg, baseModel) {
 		translated, _ = helps.InjectGoalHookConstraint(translated)
 	}
-	// CPA PATCH: apply auto mode overrides at executor level (belt over handler's suspenders).
-	// Handler already handles redirect + max_tokens in Claude format.
-	// This uses opts.OriginalRequest (handler-modified, contains alias) for config lookup
-	// because baseModel at this point is the upstream name and wouldn't match rules.
+	// CPA PATCH: apply auto mode overrides at executor level.
+	// Handler already handled redirect + max_tokens. opts.OriginalRequest at this
+	// point has model=redirectTarget (client-facing name, matches config rules).
+	// baseModel is the upstream name which wouldn't match the rules.
 	translated = helps.ApplyCCAutoMode(translated, e.cfg, opts.OriginalRequest)
 
 	// Request usage data in the final streaming chunk so that token statistics
