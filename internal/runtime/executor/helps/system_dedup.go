@@ -399,7 +399,8 @@ func ConvertSkillListingToUser(body []byte) []byte {
 	}
 
 	arr := messages.Array()
-	skillIdx := -1
+	out := body
+	converted := 0
 
 	for i := range arr {
 		role := arr[i].Get("role").String()
@@ -407,41 +408,39 @@ func ConvertSkillListingToUser(body []byte) []byte {
 			continue
 		}
 		content := arr[i].Get("content")
-		if content.Type == gjson.String && strings.HasPrefix(content.String(), skillListPrefix) {
-			skillIdx = i
-			break
+		if content.Type != gjson.String || !strings.HasPrefix(content.String(), skillListPrefix) {
+			continue
 		}
+
+		originalContent := content.String()
+		wrappedContent := "<system-reminder>\n" + originalContent + "\n</system-reminder>"
+
+		rolePath := fmt.Sprintf("messages.%d.role", i)
+		var err error
+		out, err = sjson.SetBytes(out, rolePath, "user")
+		if err != nil {
+			log.WithField("module", "system_dedup").Warnf("skill-listing: failed to set role for messages.%d: %v", i, err)
+			continue
+		}
+
+		contentPath := fmt.Sprintf("messages.%d.content", i)
+		out, err = sjson.SetBytes(out, contentPath, wrappedContent)
+		if err != nil {
+			log.WithField("module", "system_dedup").Warnf("skill-listing: failed to set content for messages.%d: %v", i, err)
+			continue
+		}
+
+		converted++
+		log.WithFields(log.Fields{
+			"module":         "system_dedup",
+			"at":             i,
+			"original_bytes": len(originalContent),
+		}).Debug("system_dedup: converted skill listing system message to <system-reminder> user message [cpa-skill-listing]")
 	}
 
-	if skillIdx < 0 {
+	if converted == 0 {
 		return body
 	}
-
-	originalContent := arr[skillIdx].Get("content").String()
-	wrappedContent := "<system-reminder>\n" + originalContent + "\n</system-reminder>"
-
-	out := body
-	var err error
-
-	rolePath := fmt.Sprintf("messages.%d.role", skillIdx)
-	out, err = sjson.SetBytes(out, rolePath, "user")
-	if err != nil {
-		log.WithField("module", "system_dedup").Warnf("skill-listing: failed to set role for messages.%d: %v", skillIdx, err)
-		return body
-	}
-
-	contentPath := fmt.Sprintf("messages.%d.content", skillIdx)
-	out, err = sjson.SetBytes(out, contentPath, wrappedContent)
-	if err != nil {
-		log.WithField("module", "system_dedup").Warnf("skill-listing: failed to set content for messages.%d: %v", skillIdx, err)
-		return body
-	}
-
-	log.WithFields(log.Fields{
-		"module":         "system_dedup",
-		"at":             skillIdx,
-		"original_bytes": len(originalContent),
-	}).Debug("system_dedup: converted skill listing system message to <system-reminder> user message [cpa-skill-listing]")
 
 	return out
 }
