@@ -445,38 +445,28 @@ func ConvertSkillListingToUser(body []byte) []byte {
 	return out
 }
 
-// sysNotificationPrefix identifies CC background-task completion notifications
-// injected as role=system. CollapseSystemNotifications uses it for detection.
+// sysNotificationPrefix identifies CC background-task notifications injected
+// as role=system. CollapseSystemNotifications uses it for detection.
 const sysNotificationPrefix = "[SYSTEM NOTIFICATION"
 
-// CollapseSystemNotifications collapses multiple CC background-task
-// completion notification system messages into one (the most recent)
-// and normalizes its content to a stable byte form.
+// CollapseSystemNotifications is retained under its historical name for call
+// site compatibility. It losslessly converts every matching system message in
+// place to a user-level <system-reminder>. Message count, ordering, and the
+// complete original notification content remain unchanged.
 //
-// CC injects a unique system notification for every background command
-// that finishes. Each has different task details (<task-id>, <output-file>,
-// <summary>) and CC occasionally appends a task reminder after the
-// </task-notification> tag. Both forms of variation change the
-// system-prompt block token count and shift the tools section out of
-// KV cache alignment.
-//
-// After collapsing to a single notification, the function strips the
-// <task-notification> XML block and everything after it, replacing them
-// with a fixed placeholder. The model retains the high-attention
-// system-level "background task completed" signal while the specific
-// output (already consumed via tool results) stays visible in the
-// conversation.
-//
-// Logs at debug level when notifications are collapsed or normalized
+// This keeps task-specific content out of DeepSeek's hoisted system block
+// without discarding task IDs, status, output paths, summaries, results, or any
+// trailing reminder text. Logs at debug level when notifications are converted
 // [cpa-task-collapse].
 func CollapseSystemNotifications(body []byte) []byte {
 	messages := gjson.GetBytes(body, "messages")
-	if !messages.IsArray() || len(messages.Array()) < 2 {
+	if !messages.IsArray() {
 		return body
 	}
 
 	arr := messages.Array()
-	notifIdxs := make([]int, 0)
+	out := body
+	converted := 0
 
 	for i := range arr {
 		role := arr[i].Get("role").String()
@@ -484,117 +474,41 @@ func CollapseSystemNotifications(body []byte) []byte {
 			continue
 		}
 		content := arr[i].Get("content")
-		if content.Type == gjson.String && strings.HasPrefix(content.String(), sysNotificationPrefix) {
-			notifIdxs = append(notifIdxs, i)
-		}
-	}
-
-	if len(notifIdxs) == 0 {
-		return body
-	}
-
-	out := body
-
-	// Collapse: keep only the last notification.
-	if len(notifIdxs) > 1 {
-		keepIdx := notifIdxs[len(notifIdxs)-1]
-		removeIdxs := notifIdxs[:len(notifIdxs)-1]
-
-		for _, idx := range removeIdxs {
-			log.WithFields(log.Fields{
-				"module":  "system_dedup",
-				"at":      idx,
-				"keep_at": keepIdx,
-			}).Debug("system_dedup: collapsing stale system notification [cpa-task-collapse]")
+		if content.Type != gjson.String || !strings.HasPrefix(content.String(), sysNotificationPrefix) {
+			continue
 		}
 
-		collapsed := 0
-		for i := len(removeIdxs) - 1; i >= 0; i-- {
-			path := fmt.Sprintf("messages.%d", removeIdxs[i])
-			var err error
-			out, err = sjson.DeleteBytes(out, path)
-			if err != nil {
-				log.WithField("module", "system_dedup").Warnf("task-collapse: failed to delete notification messages.%d: %v", removeIdxs[i], err)
-				return body
-			}
-			collapsed++
-		}
+		originalContent := content.String()
+		wrappedContent := "<system-reminder>\n" + originalContent + "\n</system-reminder>"
 
-		log.WithFields(log.Fields{
-			"module":    "system_dedup",
-			"collapsed": collapsed,
-		}).Debug("system_dedup: collapsed system notifications [cpa-task-collapse]")
-	}
-
-	// Normalize: strip the variable <task-notification> block from the
-	// surviving notification so every request produces identical tokens.
-	keepIdx := notifIdxs[len(notifIdxs)-1]
-	if len(notifIdxs) > 1 {
-		keepIdx -= len(notifIdxs) - 1
-	}
-
-	keepContent := arr[notifIdxs[len(notifIdxs)-1]].Get("content").String()
-	if normalized := normalizeNotification(keepContent); normalized != keepContent {
-		contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
-		var setErr error
-		out, setErr = sjson.SetBytes(out, contentPath, normalized)
+		rolePath := fmt.Sprintf("messages.%d.role", i)
+		next, setErr := sjson.SetBytes(out, rolePath, "user")
 		if setErr != nil {
-			log.WithField("module", "system_dedup").Warnf("task-collapse: failed to normalize notification messages.%d: %v", keepIdx, setErr)
+			log.WithField("module", "system_dedup").Warnf("task-collapse: failed to convert notification role messages.%d: %v", i, setErr)
 			return body
 		}
 
-		log.WithFields(log.Fields{
-			"module":     "system_dedup",
-			"at":         keepIdx,
-			"trimmed_by": len(keepContent) - len(normalized),
-		}).Debug("system_dedup: normalized notification content [cpa-task-collapse]")
+		contentPath := fmt.Sprintf("messages.%d.content", i)
+		next, setErr = sjson.SetBytes(next, contentPath, wrappedContent)
+		if setErr != nil {
+			log.WithField("module", "system_dedup").Warnf("task-collapse: failed to wrap notification content messages.%d: %v", i, setErr)
+			return body
+		}
+
+		out = next
+		converted++
 	}
 
-	// Convert the surviving notification to a <system-reminder> user
-	// message. This keeps the notification out of DeepSeek's system_block,
-	// preventing token-position shifts when CC injects its first
-	// background-task notification mid-session.
-	currentContent := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", keepIdx)).String()
-	wrappedContent := "<system-reminder>\n" + currentContent + "\n</system-reminder>"
-
-	rolePath := fmt.Sprintf("messages.%d.role", keepIdx)
-	var setErr error
-	out, setErr = sjson.SetBytes(out, rolePath, "user")
-	if setErr != nil {
-		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to convert notification role messages.%d: %v", keepIdx, setErr)
-		return body
-	}
-
-	contentPath := fmt.Sprintf("messages.%d.content", keepIdx)
-	out, setErr = sjson.SetBytes(out, contentPath, wrappedContent)
-	if setErr != nil {
-		log.WithField("module", "system_dedup").Warnf("task-collapse: failed to wrap notification content messages.%d: %v", keepIdx, setErr)
+	if converted == 0 {
 		return body
 	}
 
 	log.WithFields(log.Fields{
-		"module":         "system_dedup",
-		"at":             keepIdx,
-		"original_bytes": len(currentContent),
-	}).Debug("system_dedup: converted system notification to <system-reminder> user message [cpa-task-collapse]")
+		"module":    "system_dedup",
+		"converted": converted,
+	}).Debug("system_dedup: losslessly converted system notifications to <system-reminder> user messages [cpa-task-collapse]")
 
 	return out
-}
-
-// notificationPlaceholder replaces the variable per-task XML block inside
-// CC system notifications so the content is byte-stable across requests.
-const notificationPlaceholder = "\n\n[background task completed — output in conversation]"
-
-// normalizeNotification strips the <task-notification> XML block and
-// everything after it from a system notification, replacing the tail
-// with a fixed placeholder. Returns the input unchanged if the marker
-// is not found.
-func normalizeNotification(content string) string {
-	idx := strings.Index(content, "\n<task-notification>")
-	if idx < 0 {
-		return content
-	}
-	return strings.TrimRight(content[:idx], "\n\r") + notificationPlaceholder
 }
 
 // CollapseUnknownSystemMessages keeps only the most recent system message

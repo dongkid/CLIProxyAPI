@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -402,6 +403,28 @@ func TestCollapseTask_ZombieTaskListCleanup(t *testing.T) {
 
 // --- CollapseSystemNotifications tests ---
 
+func mustMarshalMessages(t *testing.T, messages []map[string]any) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"messages": messages})
+	if err != nil {
+		t.Fatalf("failed to marshal messages: %v", err)
+	}
+	return body
+}
+
+func assertNotificationAt(t *testing.T, body []byte, index int, original string) {
+	t.Helper()
+	role := gjson.GetBytes(body, fmt.Sprintf("messages.%d.role", index)).String()
+	if role != "user" {
+		t.Fatalf("message %d: expected role=user, got %q", index, role)
+	}
+	want := "<system-reminder>\n" + original + "\n</system-reminder>"
+	content := gjson.GetBytes(body, fmt.Sprintf("messages.%d.content", index)).String()
+	if content != want {
+		t.Fatalf("message %d: notification content changed\nwant: %q\n got: %q", index, want, content)
+	}
+}
+
 func TestCollapseNotif_NoMessages(t *testing.T) {
 	body := []byte(`{"model":"deepseek"}`)
 	out := CollapseSystemNotifications(body)
@@ -419,64 +442,72 @@ func TestCollapseNotif_NoNotifications(t *testing.T) {
 }
 
 func TestCollapseNotif_SingleNotification(t *testing.T) {
-	// Single notification → normalized (XML block stripped)
-	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event.\n\n<task-notification>\n<task-id>abc</task-id>\n<output-file>/tmp/x</output-file>\n</task-notification>"}]}`)
+	original := "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event.\n\n<task-notification>\n<task-id>abc</task-id>\n<tool-use-id>tool-123</tool-use-id>\n<output-file>/tmp/x</output-file>\n<status>completed</status>\n<summary>Done</summary>\n<result>full task result</result>\n</task-notification>\nTRAILING REMINDER"
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "be helpful"},
+		{"role": "system", "content": original},
+	})
 	out := CollapseSystemNotifications(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
 	if count != 2 {
 		t.Fatalf("expected 2 messages, got %d: %s", count, string(out))
 	}
-	kept := gjson.GetBytes(out, "messages.1.content").String()
-	if strings.Contains(kept, "<task-notification>") || strings.Contains(kept, "<task-id>") {
-		t.Fatalf("XML block should have been stripped, got: %s", kept)
-	}
-	if !strings.Contains(kept, "background task completed") {
-		t.Fatalf("normalized notification should have placeholder, got: %s", kept)
-	}
+	assertNotificationAt(t, out, 1, original)
 }
 
 func TestCollapseNotif_MultipleNotifications(t *testing.T) {
-	// Multiple → collapsed to 1, normalized, then converted to <system-reminder> user
-	body := []byte(`{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"start"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"assistant","content":"ok"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>b</task-id>\n</task-notification>"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>c</task-id>\n</task-notification>"}]}`)
+	notificationA := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>a</task-id>\n<result>result-a</result>\n</task-notification>"
+	notificationB := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b</task-id>\n<result>result-b</result>\n</task-notification>"
+	notificationC := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>c</task-id>\n<result>result-c</result>\n</task-notification>"
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "You are helpful."},
+		{"role": "user", "content": "start"},
+		{"role": "system", "content": notificationA},
+		{"role": "assistant", "content": "ok"},
+		{"role": "system", "content": notificationB},
+		{"role": "system", "content": notificationC},
+	})
 	out := CollapseSystemNotifications(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 4 {
-		t.Fatalf("expected 4 messages, got %d: %s", count, string(out))
+	if count != 6 {
+		t.Fatalf("expected all 6 messages, got %d: %s", count, string(out))
 	}
-	notifCount := 0
-	for i := 0; i < int(count); i++ {
-		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
-		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, sysNotificationPrefix) {
-			notifCount++
-			if strings.Contains(c, "<task-notification>") {
-				t.Fatalf("XML block should be stripped, got: %s", c)
-			}
-		}
-	}
-	if notifCount != 1 {
-		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifCount)
+	assertNotificationAt(t, out, 2, notificationA)
+	assertNotificationAt(t, out, 4, notificationB)
+	assertNotificationAt(t, out, 5, notificationC)
+	if gjson.GetBytes(out, "messages.3.role").String() != "assistant" {
+		t.Fatalf("non-notification message order changed: %s", string(out))
 	}
 }
 
 func TestCollapseNotif_OnlyNotifications(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>1</task-id>\n</task-notification>TASK_REMINDER_TAIL"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>2</task-id>\n</task-notification>MORE_TAIL"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>3</task-id>\n</task-notification>STUFF"}]}`)
+	notificationA := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>1</task-id>\n</task-notification>TASK_REMINDER_TAIL"
+	notificationB := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>2</task-id>\n</task-notification>MORE_TAIL"
+	notificationC := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>3</task-id>\n</task-notification>STUFF"
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": notificationA},
+		{"role": "system", "content": notificationB},
+		{"role": "system", "content": notificationC},
+	})
 	out := CollapseSystemNotifications(body)
 	count := gjson.GetBytes(out, "messages.#").Int()
-	if count != 1 {
-		t.Fatalf("expected 1 message, got %d: %s", count, string(out))
+	if count != 3 {
+		t.Fatalf("expected all 3 messages, got %d: %s", count, string(out))
 	}
-	kept := gjson.GetBytes(out, "messages.0.content").String()
-	if strings.Contains(kept, "STUFF") || strings.Contains(kept, "TASK_REMINDER_TAIL") {
-		t.Fatalf("tail after XML should be stripped, got: %s", kept)
-	}
-	if !strings.Contains(kept, "background task completed") {
-		t.Fatalf("should have placeholder, got: %s", kept)
-	}
+	assertNotificationAt(t, out, 0, notificationA)
+	assertNotificationAt(t, out, 1, notificationB)
+	assertNotificationAt(t, out, 2, notificationC)
 }
 
 func TestCollapseNotif_Idempotent(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>b</task-id>\n</task-notification>tail"},{"role":"user","content":"hi"}]}`)
+	notificationA := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>a</task-id>\n</task-notification>"
+	notificationB := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b</task-id>\n<result>result-b</result>\n</task-notification>tail"
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "be helpful"},
+		{"role": "system", "content": notificationA},
+		{"role": "system", "content": notificationB},
+		{"role": "user", "content": "hi"},
+	})
 	out1 := CollapseSystemNotifications(body)
 	out2 := CollapseSystemNotifications(out1)
 	c1 := gjson.GetBytes(out1, "messages.#").Int()
@@ -487,70 +518,138 @@ func TestCollapseNotif_Idempotent(t *testing.T) {
 	if string(out1) != string(out2) {
 		t.Fatalf("idempotent: bodies differ\npass1: %s\npass2: %s", string(out1), string(out2))
 	}
-	// Verify notification converted to <system-reminder> user
-	notifCount := 0
-	for i := 0; i < int(c1); i++ {
-		r := gjson.GetBytes(out1, fmt.Sprintf("messages.%d.role", i)).String()
-		c := gjson.GetBytes(out1, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, sysNotificationPrefix) {
-			notifCount++
-			if strings.Contains(c, "<task-notification>") || strings.Contains(c, "tail") {
-				t.Fatalf("notification should be normalized, got: %s", c)
-			}
-		}
-	}
-	if notifCount != 1 {
-		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifCount)
-	}
+	assertNotificationAt(t, out1, 1, notificationA)
+	assertNotificationAt(t, out1, 2, notificationB)
 }
 
 func TestCollapseNotif_WithTaskReminders(t *testing.T) {
-	// New pipeline order: notification normalization runs FIRST,
-	// cleaning embedded task reminders before CollapseTaskReminders sees them.
-	body := []byte(`{"messages":[{"role":"system","content":"be helpful"},{"role":"system","content":"The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Do thing"},{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n<task-notification>\n<task-id>a</task-id>\n</task-notification>\n\nThe task tools haven't been used recently. EMBEDDED REMINDER"},{"role":"user","content":"u1"}]}`)
-	// New order: notif collapse first, then task collapse
+	taskReminder := "The task tools haven't been used recently.\n\nHere are the existing tasks:\n\n#1. Do thing"
+	notification := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>a</task-id>\n<result>result-a</result>\n</task-notification>\n\nThe task tools haven't been used recently. EMBEDDED REMINDER"
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "be helpful"},
+		{"role": "system", "content": taskReminder},
+		{"role": "system", "content": notification},
+		{"role": "user", "content": "u1"},
+	})
 	out := CollapseSystemNotifications(body)
 	out = CollapseTaskReminders(out)
 
-	count := gjson.GetBytes(out, "messages.#").Int()
-	notifCount := 0
-	taskPreambleCount := 0
-	for i := 0; i < int(count); i++ {
-		r := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", i)).String()
-		c := gjson.GetBytes(out, fmt.Sprintf("messages.%d.content", i)).String()
-		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, sysNotificationPrefix) {
-			notifCount++
-			if strings.Contains(c, "EMBEDDED REMINDER") || strings.Contains(c, "<task-notification>") {
-				t.Fatalf("notification should be normalized (embedded reminder stripped), got: %s", c)
-			}
-		}
-		if r == "user" && strings.HasPrefix(c, "<system-reminder>") && strings.Contains(c, taskReminderPrefix) {
-			taskPreambleCount++
-			if !strings.Contains(c, "Here are the existing tasks") {
-				t.Fatalf("task reminder should preserve task list marker, got: %s", c)
-			}
-		}
+	if gjson.GetBytes(out, "messages.#").Int() != 4 {
+		t.Fatalf("expected message count to remain unchanged: %s", string(out))
 	}
-	if notifCount != 1 {
-		t.Fatalf("expected 1 notification as <system-reminder> user, got %d", notifCount)
-	}
-	if taskPreambleCount != 1 {
-		t.Fatalf("expected 1 task reminder as <system-reminder> user, got %d", taskPreambleCount)
+	assertNotificationAt(t, out, 2, notification)
+	taskContent := gjson.GetBytes(out, "messages.1.content").String()
+	if taskContent != "<system-reminder>\n"+taskReminder+"\n</system-reminder>" {
+		t.Fatalf("task reminder content changed unexpectedly: %q", taskContent)
 	}
 }
 
 func TestCollapseNotif_NoMarker(t *testing.T) {
-	// Notification without <task-notification> marker → converted to <system-reminder> user
-	body := []byte(`{"messages":[{"role":"system","content":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification."},{"role":"user","content":"hi"}]}`)
+	original := "[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification."
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": original},
+		{"role": "user", "content": "hi"},
+	})
 	out := CollapseSystemNotifications(body)
-	r := gjson.GetBytes(out, "messages.0.role").String()
-	if r != "user" {
-		t.Fatalf("without marker, role should be converted to user, got: %s", r)
+	assertNotificationAt(t, out, 0, original)
+}
+
+func TestCollapseNotif_NonStringContentPassesThrough(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"[SYSTEM NOTIFICATION - NOT USER INPUT]"}]},{"role":"user","content":"hi"}]}`)
+	out := CollapseSystemNotifications(body)
+	if string(out) != string(body) {
+		t.Fatalf("non-string content should pass through unchanged, got %s", string(out))
 	}
-	kept := gjson.GetBytes(out, "messages.0.content").String()
-	expected := "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\nJust a plain notification.\n</system-reminder>"
-	if kept != expected {
-		t.Fatalf("without marker, content should be wrapped in <system-reminder>, got: %s", kept)
+}
+
+func TestCollapseNotif_PreservesStatusHistoryForSameTask(t *testing.T) {
+	killed := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>same-task</task-id>\n<status>killed</status>\n<summary>Stopped</summary>\n</task-notification>"
+	completed := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>same-task</task-id>\n<status>completed</status>\n<summary>Finished</summary>\n<result>final result</result>\n</task-notification>"
+	body := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": killed},
+		{"role": "assistant", "content": "continuing"},
+		{"role": "system", "content": completed},
+	})
+	out := CollapseSystemNotifications(body)
+	if gjson.GetBytes(out, "messages.#").Int() != 3 {
+		t.Fatalf("status history message count changed: %s", string(out))
+	}
+	assertNotificationAt(t, out, 0, killed)
+	assertNotificationAt(t, out, 2, completed)
+}
+
+func TestCollapseNotif_PreservesLongResultByteForByte(t *testing.T) {
+	longResult := strings.Repeat("large-result-中文-line\n", 2000)
+	original := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>large-task</task-id>\n<tool-use-id>tool-large</tool-use-id>\n<output-file>C:\\tmp\\large.txt</output-file>\n<status>completed</status>\n<summary>Large result</summary>\n<result>" + longResult + "</result>\n</task-notification>"
+	body := mustMarshalMessages(t, []map[string]any{{"role": "system", "content": original}})
+	out := CollapseSystemNotifications(body)
+	if gjson.GetBytes(out, "messages.#").Int() != 1 {
+		t.Fatalf("single long notification should remain one message: %s", string(out))
+	}
+	assertNotificationAt(t, out, 0, original)
+}
+
+func TestCollapseNotif_ThreeTurnLifecycleKeepsStableHistory(t *testing.T) {
+	notificationA := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>a</task-id>\n<status>completed</status>\n<result>result-a</result>\n</task-notification>"
+	notificationB := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b</task-id>\n<status>completed</status>\n<result>result-b</result>\n</task-notification>"
+
+	turn1Raw := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "base prompt"},
+		{"role": "system", "content": notificationA},
+		{"role": "user", "content": "turn one"},
+	})
+	turn2Raw := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "base prompt"},
+		{"role": "system", "content": notificationA},
+		{"role": "user", "content": "turn one"},
+		{"role": "assistant", "content": "answer one"},
+		{"role": "system", "content": notificationB},
+		{"role": "user", "content": "turn two"},
+	})
+	turn3Raw := mustMarshalMessages(t, []map[string]any{
+		{"role": "system", "content": "base prompt"},
+		{"role": "system", "content": notificationA},
+		{"role": "user", "content": "turn one"},
+		{"role": "assistant", "content": "answer one"},
+		{"role": "system", "content": notificationB},
+		{"role": "user", "content": "turn two"},
+		{"role": "assistant", "content": "answer two"},
+		{"role": "user", "content": "turn three"},
+	})
+
+	turn1 := CollapseSystemNotifications(turn1Raw)
+	turn2 := CollapseSystemNotifications(turn2Raw)
+	turn3 := CollapseSystemNotifications(turn3Raw)
+
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+		out  []byte
+	}{
+		{name: "turn1", raw: turn1Raw, out: turn1},
+		{name: "turn2", raw: turn2Raw, out: turn2},
+		{name: "turn3", raw: turn3Raw, out: turn3},
+	} {
+		if gjson.GetBytes(tc.out, "messages.#").Int() != gjson.GetBytes(tc.raw, "messages.#").Int() {
+			t.Fatalf("%s: message count changed", tc.name)
+		}
+	}
+
+	assertNotificationAt(t, turn1, 1, notificationA)
+	assertNotificationAt(t, turn2, 1, notificationA)
+	assertNotificationAt(t, turn2, 4, notificationB)
+	assertNotificationAt(t, turn3, 1, notificationA)
+	assertNotificationAt(t, turn3, 4, notificationB)
+
+	if gjson.GetBytes(turn1, "messages.1").Raw != gjson.GetBytes(turn2, "messages.1").Raw ||
+		gjson.GetBytes(turn2, "messages.1").Raw != gjson.GetBytes(turn3, "messages.1").Raw {
+		t.Fatal("previously converted notification A moved or changed across turns")
+	}
+	if gjson.GetBytes(turn2, "messages.4").Raw != gjson.GetBytes(turn3, "messages.4").Raw {
+		t.Fatal("previously converted notification B moved or changed across turns")
+	}
+	if gjson.GetBytes(turn3, "messages.7.content").String() != "turn three" {
+		t.Fatalf("latest user message moved or changed: %s", string(turn3))
 	}
 }
 
