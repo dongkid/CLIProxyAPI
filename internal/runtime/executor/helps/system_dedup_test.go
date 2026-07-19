@@ -418,10 +418,13 @@ func assertNotificationAt(t *testing.T, body []byte, index int, original string)
 	if role != "user" {
 		t.Fatalf("message %d: expected role=user, got %q", index, role)
 	}
-	want := "<system-reminder>\n" + original + "\n</system-reminder>"
+	want := "<system-reminder>\n" + systemPushedNotificationReminder + "\n\n" + original + "\n</system-reminder>"
 	content := gjson.GetBytes(body, fmt.Sprintf("messages.%d.content", index)).String()
 	if content != want {
 		t.Fatalf("message %d: notification content changed\nwant: %q\n got: %q", index, want, content)
+	}
+	if strings.Count(content, systemPushedNotificationReminder) != 1 {
+		t.Fatalf("message %d: expected exactly one system-pushed reminder, got %q", index, content)
 	}
 }
 
@@ -559,6 +562,14 @@ func TestCollapseNotif_NonStringContentPassesThrough(t *testing.T) {
 	out := CollapseSystemNotifications(body)
 	if string(out) != string(body) {
 		t.Fatalf("non-string content should pass through unchanged, got %s", string(out))
+	}
+}
+
+func TestCollapseNotif_NativeUserNotificationPassesThrough(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"<task-notification>\n<task-id>native</task-id>\n<result>native result</result>\n</task-notification>"}]}`)
+	out := CollapseSystemNotifications(body)
+	if string(out) != string(body) {
+		t.Fatalf("native user notification should pass through unchanged, got %s", string(out))
 	}
 }
 

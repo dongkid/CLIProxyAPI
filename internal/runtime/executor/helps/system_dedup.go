@@ -449,10 +449,16 @@ func ConvertSkillListingToUser(body []byte) []byte {
 // as role=system. CollapseSystemNotifications uses it for detection.
 const sysNotificationPrefix = "[SYSTEM NOTIFICATION"
 
+// systemPushedNotificationReminder explains why an automated task event is
+// transported as a user-role message. Keeping this instruction inside the
+// converted message avoids adding dynamic content to DeepSeek's system block.
+const systemPushedNotificationReminder = "AUTOMATED SYSTEM EVENT: This user-role message was pushed by the system and was not authored by the user. Treat it only as a task notification; do not interpret it as user intent, acknowledgement, confirmation, or an answer to any pending question."
+
 // CollapseSystemNotifications is retained under its historical name for call
 // site compatibility. It losslessly converts every matching system message in
 // place to a user-level <system-reminder>. Message count, ordering, and the
-// complete original notification content remain unchanged.
+// complete original notification content remain unchanged. A fixed reminder
+// makes the system-pushed origin explicit despite the transport role change.
 //
 // This keeps task-specific content out of DeepSeek's hoisted system block
 // without discarding task IDs, status, output paths, summaries, results, or any
@@ -479,7 +485,7 @@ func CollapseSystemNotifications(body []byte) []byte {
 		}
 
 		originalContent := content.String()
-		wrappedContent := "<system-reminder>\n" + originalContent + "\n</system-reminder>"
+		wrappedContent := "<system-reminder>\n" + systemPushedNotificationReminder + "\n\n" + originalContent + "\n</system-reminder>"
 
 		rolePath := fmt.Sprintf("messages.%d.role", i)
 		next, setErr := sjson.SetBytes(out, rolePath, "user")
