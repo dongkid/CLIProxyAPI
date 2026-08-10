@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	openaiclude "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -108,9 +109,21 @@ func (e *OpenAICompatExecutor) cpaPipeline() *config.CPAPipelineConfig {
 	return e.cfg.CPAPipeline
 }
 
-// cpaEnabled returns true when the CPA pipeline master switch is on.
-func (e *OpenAICompatExecutor) cpaEnabled() bool {
-	return e.isCPAStepEnabled(e.cpaPipeline().EnableMaster)
+// translateRequestCompat translates a request, using the compat (preserve-thinking)
+// variant for DeepSeek-compatible Claude→OpenAI conversions so that assistant
+// thinking text is carried into reasoning_content. DeepSeek (and proxies like
+// OpenCode zen/go) require reasoning_content to be passed back in multi-turn
+// thinking-mode conversations; Claude Code emits thinking blocks with empty
+// signatures, which the strict translator would drop. All other paths keep the
+// standard translator. The model match uses the same deepseek-prefix rule as
+// RestoreDeepSeekReasoningEffort so the compat switch and the effort restoration
+// stay consistent.
+func (e *OpenAICompatExecutor) translateRequestCompat(from, to sdktranslator.Format, baseModel string, payload []byte, stream bool) []byte {
+	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAI &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(baseModel)), "deepseek") {
+		return openaiclude.ConvertClaudeRequestToOpenAIWithCompat(baseModel, payload, stream)
+	}
+	return sdktranslator.TranslateRequest(from, to, baseModel, payload, stream)
 }
 
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
@@ -174,8 +187,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	originalTranslated := e.translateRequestCompat(from, to, baseModel, originalPayload, opts.Stream)
+	translated := e.translateRequestCompat(from, to, baseModel, req.Payload, opts.Stream)
 
 	// Save user-requested reasoning_effort before ApplyThinking clamps it.
 	// DeepSeek models support levels (xhigh/max) that the registry may
@@ -208,7 +221,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// EnsureReasoningContentInAssistantMessages would skip due to missing reasoning_effort.
 	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
 
-	if e.cpaEnabled() {
+	if pipeline := e.cpaPipeline(); pipeline != nil && e.isCPAStepEnabled(pipeline.EnableMaster) {
 		cpaStep := func(name string, body []byte, fn func([]byte) []byte) []byte {
 			before := helps.CountMessagesByRole(body)
 			result := fn(body)
@@ -216,30 +229,30 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			helps.AppendCPAPipelineDelta(ctx, helps.FormatCPADelta(name, before, after))
 			return result
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnablePTUNormalization) {
+		if e.isCPAStepEnabled(pipeline.EnablePTUNormalization) {
 			translated = cpaStep("cpa-norm", translated, helps.NormalizePreToolUseMessages)
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
+		if e.isCPAStepEnabled(pipeline.EnableSystemDedup) {
 			translated = cpaStep("cpa-dedup", translated, helps.DeduplicateSystemMessages)
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
+		if e.isCPAStepEnabled(pipeline.EnableTaskCollapse) {
 			translated = cpaStep("cpa-task-collapse", translated, helps.CollapseSystemNotifications)
 			translated = cpaStep("cpa-task-collapse", translated, helps.CollapseTaskReminders)
 			translated = cpaStep("cpa-skill-listing", translated, helps.ConvertSkillListingToUser)
 			translated = cpaStep("cpa-task-collapse", translated, helps.CollapseUnknownSystemMessages)
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
+		if e.isCPAStepEnabled(pipeline.EnableHookReanchor) {
 			translated = cpaStep("cpa-reanchor", translated, helps.ReanchorHooks)
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
+		if e.isCPAStepEnabled(pipeline.EnableHookRelocation) {
 			translated = cpaStep("cpa-reloc", translated, helps.RelocateHookMessages)
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
+		if e.isCPAStepEnabled(pipeline.EnableToolSort) {
 			translated = cpaStep("cpa-toolsort", translated, helps.SortToolsByName)
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableReorderJSON) {
+		if e.isCPAStepEnabled(pipeline.EnableReorderJSON) {
 			translated = cpaStep("cpa-reorder-json", translated, helps.ReorderJSONForCache)
-		} else if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
+		} else if e.isCPAStepEnabled(pipeline.EnableCanonicalize) {
 			translated = cpaStep("cpa-canon", translated, helps.CanonicalizeJSON)
 		}
 	}
@@ -449,8 +462,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated := e.translateRequestCompat(from, to, baseModel, originalPayload, true)
+	translated := e.translateRequestCompat(from, to, baseModel, req.Payload, true)
 
 	originalEffort := gjson.GetBytes(translated, "reasoning_effort").String()
 
@@ -482,32 +495,32 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	translated = helps.EnsureReasoningContentInAssistantMessages(translated)
-	if e.cpaEnabled() {
-		if e.isCPAStepEnabled(e.cpaPipeline().EnablePTUNormalization) {
+	if pipeline := e.cpaPipeline(); pipeline != nil && e.isCPAStepEnabled(pipeline.EnableMaster) {
+		if e.isCPAStepEnabled(pipeline.EnablePTUNormalization) {
 			translated = helps.NormalizePreToolUseMessages(translated) // [cpa-norm]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableSystemDedup) {
+		if e.isCPAStepEnabled(pipeline.EnableSystemDedup) {
 			translated = helps.DeduplicateSystemMessages(translated) // [cpa-dedup]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableTaskCollapse) {
+		if e.isCPAStepEnabled(pipeline.EnableTaskCollapse) {
 			translated = helps.CollapseSystemNotifications(translated)   // [cpa-task-collapse]
 			translated = helps.SplitCombinedSystemMessages(translated)   // [cpa-combined-split]
 			translated = helps.CollapseTaskReminders(translated)         // [cpa-task-collapse]
 			translated = helps.ConvertSkillListingToUser(translated)     // [cpa-skill-listing]
 			translated = helps.CollapseUnknownSystemMessages(translated) // [cpa-task-collapse]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookReanchor) {
+		if e.isCPAStepEnabled(pipeline.EnableHookReanchor) {
 			translated = helps.ReanchorHooks(translated) // [cpa-reanchor]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableHookRelocation) {
+		if e.isCPAStepEnabled(pipeline.EnableHookRelocation) {
 			translated = helps.RelocateHookMessages(translated) // [cpa-reloc]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableToolSort) {
+		if e.isCPAStepEnabled(pipeline.EnableToolSort) {
 			translated = helps.SortToolsByName(translated) // [cpa-toolsort]
 		}
-		if e.isCPAStepEnabled(e.cpaPipeline().EnableReorderJSON) {
+		if e.isCPAStepEnabled(pipeline.EnableReorderJSON) {
 			translated = helps.ReorderJSONForCache(translated) // [cpa-reorder-json]
-		} else if e.isCPAStepEnabled(e.cpaPipeline().EnableCanonicalize) {
+		} else if e.isCPAStepEnabled(pipeline.EnableCanonicalize) {
 			translated = helps.CanonicalizeJSON(translated) // [cpa-canon]
 		}
 	}
@@ -781,7 +794,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translated := e.translateRequestCompat(from, to, baseModel, req.Payload, false)
 
 	modelForCounting := baseModel
 

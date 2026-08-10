@@ -920,17 +920,49 @@ func matchModelPattern(pattern, model string) bool {
 
 // EnsureReasoningContentInAssistantMessages ensures every assistant message in the
 // messages array has a reasoning_content field when the request targets a DeepSeek
-// model with reasoning_effort set (thinking mode). DeepSeek APIs reject requests
-// where any assistant message is missing this field.
+// model that is in thinking mode. DeepSeek (and OpenCode zen/go which proxies
+// DeepSeek) reject requests where any assistant message is missing this field once
+// thinking mode is active.
+//
+// Thinking mode is detected from any of these signals:
+//  1. The current request explicitly requests thinking via reasoning_effort.
+//  2. Any prior assistant message already carries reasoning_content (the
+//     conversation already entered thinking mode).
+//  3. The request carries tools and any assistant message has tool_calls (per
+//     DeepSeek docs, requests carrying the tools parameter must pass reasoning_content
+//     back on every assistant turn, including tool-call turns).
+//
+// The tool_calls signal matters most: in multi-turn tool-calling conversations a
+// later turn can omit reasoning_effort while the conversation is still in thinking
+// mode, and a bare assistant tool-call message would slip through unpatched,
+// causing a 400 "The reasoning_content in the thinking mode must be passed back to
+// the API." This matches the litellm DeepSeek V4 fix (PR #26660/#28057).
 func EnsureReasoningContentInAssistantMessages(body []byte) []byte {
-	if !gjson.GetBytes(body, "reasoning_effort").Exists() {
-		return body
-	}
 	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
 	if !strings.HasPrefix(model, "deepseek") {
 		return body
 	}
 	messages := gjson.GetBytes(body, "messages").Array()
+	hasTools := gjson.GetBytes(body, "tools").Exists()
+	thinkingActive := gjson.GetBytes(body, "reasoning_effort").Exists()
+	if !thinkingActive {
+		for _, m := range messages {
+			if m.Get("role").String() != "assistant" {
+				continue
+			}
+			if m.Get("reasoning_content").Exists() {
+				thinkingActive = true
+				break
+			}
+			if hasTools && m.Get("tool_calls").Exists() {
+				thinkingActive = true
+				break
+			}
+		}
+	}
+	if !thinkingActive {
+		return body
+	}
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Get("role").String() != "assistant" {
 			continue

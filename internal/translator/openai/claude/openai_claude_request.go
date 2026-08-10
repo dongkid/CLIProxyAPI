@@ -19,6 +19,19 @@ import (
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the OpenAI API.
 func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToOpenAI(modelName, inputRawJSON, stream, false)
+}
+
+// ConvertClaudeRequestToOpenAIWithCompat is like ConvertClaudeRequestToOpenAI but preserves
+// assistant thinking text (preserveThinkingBlocks=true) even when the thinking block carries
+// an empty or incompatible signature. This is needed for DeepSeek-compatible endpoints
+// (and proxies like OpenCode zen/go) which require reasoning_content to be passed back in
+// multi-turn thinking-mode conversations. See shouldMapClaudeThinkingToGPTReasoning.
+func ConvertClaudeRequestToOpenAIWithCompat(modelName string, inputRawJSON []byte, stream bool) []byte {
+	return convertClaudeRequestToOpenAI(modelName, inputRawJSON, stream, true)
+}
+
+func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream bool, preserveThinkingBlocks bool) []byte {
 	rawJSON := inputRawJSON
 	// Base OpenAI Chat Completions API template
 	out := []byte(`{"model":"","messages":[]}`)
@@ -148,7 +161,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					case "thinking":
 						// Only map thinking to reasoning_content for assistant messages (security: prevent injection)
 						if role == "assistant" {
-							if !shouldMapClaudeThinkingToGPTReasoning(part) {
+							if !shouldMapClaudeThinkingToGPTReasoning(part, preserveThinkingBlocks) {
 								return true
 							}
 							thinkingText := thinking.GetThinkingText(part)
@@ -333,7 +346,16 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	return out
 }
 
-func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result) bool {
+func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result, preserveThinkingBlocks ...bool) bool {
+	// When preserveThinkingBlocks is requested (DeepSeek-compatible endpoints), always
+	// map thinking to reasoning_content, even when the signature is empty or incompatible.
+	// This is required because DeepSeek requires reasoning_content to be passed back in
+	// multi-turn thinking-mode conversations, and Claude Code emits thinking blocks with
+	// an empty signature. Signature validation is intentionally skipped only in this
+	// opt-in compat path; the default path keeps strict signature checks.
+	if len(preserveThinkingBlocks) > 0 && preserveThinkingBlocks[0] {
+		return true
+	}
 	signature := part.Get("signature")
 	if !signature.Exists() || strings.TrimSpace(signature.String()) == "" {
 		return false
