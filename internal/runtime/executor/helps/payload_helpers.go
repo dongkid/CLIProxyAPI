@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -937,47 +939,151 @@ func matchModelPattern(pattern, model string) bool {
 // mode, and a bare assistant tool-call message would slip through unpatched,
 // causing a 400 "The reasoning_content in the thinking mode must be passed back to
 // the API." This matches the litellm DeepSeek V4 fix (PR #26660/#28057).
+//
+// Performance notes:
+//   - No .Array() materialization. Detection is a single fused ForEach pass holding
+//     two boolean accumulators (thinkingActive / needsPatch) with early exit and
+//     zero allocation.
+//   - The previous patch loop re-encoded the whole body per missing message
+//     (O(MxN) quadratic). This implementation rebuilds the messages array exactly
+//     once (per-message sjson.Set on only the patched messages, everything else
+//     passed through byte-for-byte) and writes it back with a single
+//     sjson.SetRawBytes -> O(N) linear.
+//   - Null-valued reasoning_content / tools / reasoning_effort are treated as
+//     absent (presentValue checks Type != Null), so a serializer emitting null for
+//     an unset field does not spuriously arm a thinking signal.
+//   - The patched branch re-serializes the messages array with single-comma element
+//     separators (semantically identical JSON; re-normalized downstream by CPA's
+//     CanonicalizeJSON/ReorderJSONForCache). The no-change path returns the original
+//     body byte-for-byte.
+//
+// Known limitation (KV prefix stability): thinking mode is latched per-request from
+// request params (reasoning_effort / tools) and history state (reasoning_content /
+// tool_calls). reasoning_content is a proxy-side construct; a client that toggles
+// the tools parameter (or reasoning_effort) between rounds can flip the translated
+// history between "has reasoning_content" and "has none", changing the byte-prefix
+// of the shared history and invalidating the KV cache prefix for that segment.
+// This is a one-off cache miss, not a correctness issue; steady state (stable
+// tools + thinking enabled) is deterministic.
 func EnsureReasoningContentInAssistantMessages(body []byte) []byte {
+	// Non-DeepSeek fast path: read only the model field, never touch messages.
 	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
 	if !strings.HasPrefix(model, "deepseek") {
+		// Diagnostic: if the request carries a thinking signal (reasoning_effort /
+		// tools) but the model is not deepseek-prefixed, a DeepSeek-compatible
+		// backend reached through an aliased model name would silently skip the
+		// reasoning_content patch and re-hit the DeepSeek 400. Surface it once so
+		// the misconfiguration is visible instead of silently failing.
+		if presentValue(gjson.ParseBytes(body), "reasoning_effort") ||
+			presentValue(gjson.ParseBytes(body), "tools") {
+			log.Warnf("[ensure-reasoning] non-deepseek model %q carries thinking signals; reasoning_content patch skipped (DeepSeek-compatible aliases need a deepseek-prefixed model name)", model)
+		}
 		return body
 	}
-	messages := gjson.GetBytes(body, "messages").Array()
-	hasTools := gjson.GetBytes(body, "tools").Exists()
-	thinkingActive := gjson.GetBytes(body, "reasoning_effort").Exists()
-	if !thinkingActive {
-		for _, m := range messages {
+
+	// Single shared parse so that tools/reasoning_effort are located without
+	// re-scanning the (potentially huge) messages subtree.
+	root := gjson.ParseBytes(body)
+	msgs := root.Get("messages")
+	if !msgs.IsArray() {
+		// Malformed/absent/non-array messages: leave untouched.
+		return body
+	}
+	// Present-value helpers: treat JSON null as absent (a serializer may emit
+	// "reasoning_effort":null / "tools":null for an unset field; null must not
+	// spuriously arm a thinking signal).
+	hasTools := presentValue(root, "tools")
+	effortPresent := presentValue(root, "reasoning_effort") // signal 1
+
+	// Fused detect + feasibility pass: no []Result allocation, early exit once the
+	// outcome is known. Steady-state (thinking active, nothing missing) returns the
+	// original body with zero allocation.
+	thinkingActive := effortPresent
+	needsPatch := false
+	if effortPresent {
+		// Signal 1 already fired: only look for a missing field, stop at the first.
+		msgs.ForEach(func(_, m gjson.Result) bool {
+			if m.Get("role").String() == "assistant" && !presentValue(m, "reasoning_content") {
+				needsPatch = true
+				return false
+			}
+			return true
+		})
+	} else {
+		msgs.ForEach(func(_, m gjson.Result) bool {
 			if m.Get("role").String() != "assistant" {
-				continue
+				return true
 			}
-			if m.Get("reasoning_content").Exists() {
-				thinkingActive = true
-				break
+			if presentValue(m, "reasoning_content") {
+				thinkingActive = true // signal 2
+			} else {
+				needsPatch = true
+				if hasTools && presentValue(m, "tool_calls") {
+					thinkingActive = true // signal 3
+				}
 			}
-			if hasTools && m.Get("tool_calls").Exists() {
-				thinkingActive = true
-				break
-			}
-		}
+			// Both flags are monotonic accumulators; once both are set the rebuild
+			// is guaranteed and the scan can stop (rebuild re-applies the predicate).
+			return !(thinkingActive && needsPatch)
+		})
 	}
-	if !thinkingActive {
+	if !thinkingActive || !needsPatch {
+		return body // non-thinking or steady-state: byte-identical, zero allocation
+	}
+	return rebuildMessagesIfNeeded(body, msgs)
+}
+
+// presentValue reports whether the field at path exists and is not a JSON null.
+// gjson Result.Exists() returns true for present-but-null (Raw == "null"), which
+// would spuriously arm thinking signals; treating null as absent matches the
+// "field unset" intent of serializers that emit null.
+func presentValue(r gjson.Result, path string) bool {
+	v := r.Get(path)
+	return v.Exists() && v.Type != gjson.Null
+}
+
+// rebuildMessagesIfNeeded re-serializes the messages array exactly once. It is only
+// reached when thinkingActive && needsPatch. The same predicate is re-applied over
+// every message, so the backward-patch semantics (a signal at index k also patches
+// earlier missing assistant messages) hold without any index bookkeeping.
+func rebuildMessagesIfNeeded(body []byte, msgs gjson.Result) []byte {
+	// Pre-size the buffer from the raw array length to avoid geometric reallocations.
+	var buf bytes.Buffer
+	buf.Grow(len(msgs.Raw) + 8)
+	buf.WriteByte('[')
+	var abort bool
+	first := true
+	msgs.ForEach(func(_, m gjson.Result) bool {
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		if m.Get("role").String() == "assistant" && !presentValue(m, "reasoning_content") {
+			// Re-encode only this message (O(size of m)); the field is appended at
+			// the end of the object, matching the previous sjson.SetBytes position.
+			patched, err := sjson.Set(m.Raw, "reasoning_content", "")
+			if err != nil {
+				// Treat any per-message failure as all-or-nothing: never emit a
+				// half-patched body. Report the abort by returning the original body.
+				abort = true
+				return false
+			}
+			buf.WriteString(patched)
+			return true
+		}
+		buf.WriteString(m.Raw) // other messages pass through byte-for-byte
+		return true
+	})
+	if abort {
 		return body
 	}
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Get("role").String() != "assistant" {
-			continue
-		}
-		if messages[i].Get("reasoning_content").Exists() {
-			continue
-		}
-		path := fmt.Sprintf("messages.%d.reasoning_content", i)
-		var err error
-		body, err = sjson.SetBytes(body, path, "")
-		if err != nil {
-			return body
-		}
+	buf.WriteByte(']')
+
+	updated, err := sjson.SetRawBytes(body, "messages", buf.Bytes())
+	if err != nil {
+		return body // all-or-nothing: never emit a half-patched body
 	}
-	return body
+	return updated
 }
 
 // RestoreDeepSeekReasoningEffort restores the original reasoning_effort value for

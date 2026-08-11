@@ -346,14 +346,14 @@ func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	return out
 }
 
-func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result, preserveThinkingBlocks ...bool) bool {
+func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result, preserveThinkingBlocks bool) bool {
 	// When preserveThinkingBlocks is requested (DeepSeek-compatible endpoints), always
 	// map thinking to reasoning_content, even when the signature is empty or incompatible.
 	// This is required because DeepSeek requires reasoning_content to be passed back in
 	// multi-turn thinking-mode conversations, and Claude Code emits thinking blocks with
 	// an empty signature. Signature validation is intentionally skipped only in this
 	// opt-in compat path; the default path keeps strict signature checks.
-	if len(preserveThinkingBlocks) > 0 && preserveThinkingBlocks[0] {
+	if preserveThinkingBlocks {
 		return true
 	}
 	signature := part.Get("signature")
