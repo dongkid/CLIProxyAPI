@@ -168,8 +168,15 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		// Handle reasoning content delta
 		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
-				// Start thinking block even when text is empty so the
-				// round-trip preserves that reasoning_content was present.
+				if reasoningText == "" {
+					// Skip empty reasoning fragments. Some upstreams send
+					// reasoning_content as "" (not null) on every answer-phase
+					// chunk; closing and reopening the text block per tiny
+					// content chunk makes clients render each chunk as its own
+					// paragraph. A thinking block is only meaningful when it
+					// actually carries text.
+					continue
+				}
 				stopTextContentBlock(param, &results)
 				if !param.ThinkingContentBlockStarted {
 					if param.ThinkingContentBlockIndex == -1 {
@@ -181,9 +188,6 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					contentBlockStartJSONBytes, _ = sjson.SetBytes(contentBlockStartJSONBytes, "index", param.ThinkingContentBlockIndex)
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSONBytes, 2))
 					param.ThinkingContentBlockStarted = true
-				}
-				if reasoningText == "" {
-					continue
 				}
 				thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
 				thinkingDeltaJSONBytes := []byte(thinkingDeltaJSON)

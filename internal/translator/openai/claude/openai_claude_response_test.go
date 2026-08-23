@@ -364,3 +364,98 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }
+
+func TestStreaming_EmptyReasoningContentDoesNotFragmentText(t *testing.T) {
+	// Some upstreams (observed 2026-08 with teamorouter OCG) send
+	// reasoning_content as an empty string ("" instead of null) on every
+	// answer-phase chunk, with content split into very small deltas. The
+	// converter must keep the whole answer inside a single text block;
+	// otherwise Claude Code renders every 1-2 character chunk as its own
+	// paragraph.
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"主人","reasoning_content":""}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"，浮","reasoning_content":""}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"浮酱","reasoning_content":""}}]}`,
+	)
+
+	textStarts := 0
+	textDeltas := 0
+	emptyThinkingStarts := 0
+	var textContent strings.Builder
+	for _, e := range events {
+		switch e.Type {
+		case "content_block_start":
+			switch gjson.Get(e.Payload, "content_block.type").String() {
+			case "text":
+				textStarts++
+			case "thinking":
+				if gjson.Get(e.Payload, "content_block.thinking").String() == "" {
+					emptyThinkingStarts++
+				}
+			}
+		case "content_block_delta":
+			if gjson.Get(e.Payload, "delta.type").String() == "text_delta" {
+				textDeltas++
+				textContent.WriteString(gjson.Get(e.Payload, "delta.text").String())
+			}
+		}
+	}
+
+	if textStarts != 1 {
+		t.Fatalf("expected exactly 1 text content_block_start, got %d (events=%+v)", textStarts, events)
+	}
+	if textDeltas != 3 {
+		t.Fatalf("expected 3 text_deltas, got %d", textDeltas)
+	}
+	if got := textContent.String(); got != "主人，浮浮酱" {
+		t.Fatalf("accumulated text = %q, want %q", got, "主人，浮浮酱")
+	}
+	if emptyThinkingStarts != 0 {
+		t.Fatalf("expected no empty thinking blocks, got %d (events=%+v)", emptyThinkingStarts, events)
+	}
+}
+
+func TestStreaming_EmptyReasoningContentKeepsRealThinkingChain(t *testing.T) {
+	// Regression guard: "" reasoning_content during the answer phase must
+	// not suppress the real thinking chain emitted while reasoning_content
+	// actually carried text.
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"Let"}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"","reasoning_content":" me check"}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"好的","reasoning_content":""}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"，收到","reasoning_content":""}}]}`,
+	)
+
+	thinkingDeltas := 0
+	textStarts := 0
+	textDeltas := 0
+	var thinkingText strings.Builder
+	var textContent strings.Builder
+	for _, e := range events {
+		switch e.Type {
+		case "content_block_start":
+			if gjson.Get(e.Payload, "content_block.type").String() == "text" {
+				textStarts++
+			}
+		case "content_block_delta":
+			switch gjson.Get(e.Payload, "delta.type").String() {
+			case "thinking_delta":
+				thinkingDeltas++
+				thinkingText.WriteString(gjson.Get(e.Payload, "delta.thinking").String())
+			case "text_delta":
+				textDeltas++
+				textContent.WriteString(gjson.Get(e.Payload, "delta.text").String())
+			}
+		}
+	}
+
+	if thinkingDeltas != 2 || thinkingText.String() != "Let me check" {
+		t.Fatalf("thinking chain broken: deltas=%d text=%q", thinkingDeltas, thinkingText.String())
+	}
+	if textStarts != 1 {
+		t.Fatalf("expected 1 text block, got %d (events=%+v)", textStarts, events)
+	}
+	if textDeltas != 2 || textContent.String() != "好的，收到" {
+		t.Fatalf("text accumulation broken: deltas=%d text=%q", textDeltas, textContent.String())
+	}
+}
